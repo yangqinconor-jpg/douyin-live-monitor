@@ -133,14 +133,15 @@ cp live_digest.json.example live_digest.json
 如果不希望占用云服务器 CPU，将云端 `transcription_mode` 设为 `local_pull`。云端下播后仅写入 `*_pending_transcription.json`，Mac 开机后由 `local_transcriber.py` 通过 SSH 拉取 MP4，用本机 Qwen3-ASR 转写并推送飞书。
 
 ```bash
-cd /opt/douyin-live-monitor/live-digest-service
+cd /path/to/live-digest-service
 /path/to/qwen_env/bin/python local_transcriber.py --config local_transcriber.json --once
 ```
 
 复制并填写 `local_transcriber.json.example` 后，把 `live_digest.json` 放在同一目录（只保存在本机）。
 其中 `asr_model_path` 指向本机的 Qwen3-ASR-1.7B 模型目录，运行 Python 必须是已安装 `qwen-asr` 的环境。
 macOS 可将仓库中的 `com.douyin-live-monitor.local-transcriber.plist` 复制到 `~/Library/LaunchAgents/`，即可在登录时自动启动；
-它每 5 分钟检查一次云端待转写任务。任务成功后云端清单会改名为 `.done`，避免重复推送。
+复制前先把其中的 `YOUR_USER` 和路径占位符改为本机实际路径。它每 5 分钟检查一次云端待转写任务；
+任务成功后云端清单会改名为 `.done`，避免重复推送。
 
 `live-digest.service` 默认使用下列路径：
 

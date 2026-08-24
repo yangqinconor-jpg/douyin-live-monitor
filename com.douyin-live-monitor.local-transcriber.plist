@@ -6,13 +6,13 @@
   <string>com.douyin-live-monitor.local-transcriber</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/conor/Documents/Codex/2026-08-12/yo/work/qwen_env/bin/python</string>
-    <string>/Users/conor/Desktop/抖音直播监控/live-digest-service/local_transcriber.py</string>
+    <string>/Users/YOUR_USER/path/to/qwen_env/bin/python</string>
+    <string>/Users/YOUR_USER/path/to/live-digest-service/local_transcriber.py</string>
     <string>--config</string>
-    <string>/Users/conor/Desktop/抖音直播监控/live-digest-service/local_transcriber.json</string>
+    <string>/Users/YOUR_USER/path/to/live-digest-service/local_transcriber.json</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/conor/Desktop/抖音直播监控/live-digest-service</string>
+  <string>/Users/YOUR_USER/path/to/live-digest-service</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
@@ -23,8 +23,8 @@
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/conor/Desktop/抖音直播监控/live-digest-service/logs/local-transcriber.log</string>
+  <string>/Users/YOUR_USER/path/to/live-digest-service/logs/local-transcriber.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/conor/Desktop/抖音直播监控/live-digest-service/logs/local-transcriber-error.log</string>
+  <string>/Users/YOUR_USER/path/to/live-digest-service/logs/local-transcriber-error.log</string>
 </dict>
 </plist>
