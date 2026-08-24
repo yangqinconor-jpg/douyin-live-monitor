@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/douyin-live-monitor/live-digest-service
+Environment="PATH=/opt/douyin-live-monitor/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=/opt/douyin-live-monitor/.venv/bin/python live_digest_service.py --config live_digest.json
 Restart=always
 RestartSec=15
