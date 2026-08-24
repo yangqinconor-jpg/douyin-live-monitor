@@ -1,0 +1,16 @@
+[Unit]
+Description=Douyin live monitor and transcript service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/douyin-live-monitor/live-digest-service
+ExecStart=/opt/douyin-live-monitor/.venv/bin/python live_digest_service.py --config live_digest.json
+Restart=always
+RestartSec=15
+User=douyin-live
+Group=douyin-live
+
+[Install]
+WantedBy=multi-user.target
