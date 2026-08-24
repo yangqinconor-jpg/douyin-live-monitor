@@ -154,8 +154,8 @@ sudo systemctl stop live-digest.service
 ```text
 recordings/
 └── <抖音号>/
-    ├── 20260824_210000_segment_000.ts
-    ├── 20260824_210000_segment_001.ts
+├── 20260824_210000_segment_000.mp4
+├── 20260824_210000_segment_001.mp4
     ├── transcripts/
     │   ├── 20260824_210000_segment_000.txt
     │   └── 20260824_210000_segment_001.txt
