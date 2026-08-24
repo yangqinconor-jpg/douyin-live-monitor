@@ -1,0 +1,6 @@
+live_digest.json
+recordings/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
