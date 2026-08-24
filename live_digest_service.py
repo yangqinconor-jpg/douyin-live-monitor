@@ -142,38 +142,36 @@ def run_room(settings: Settings, url: str) -> None:
     room_dir.mkdir(parents=True, exist_ok=True)
     active = False
     process: subprocess.Popen[bytes] | None = None
-    announced = False
-    handled: set[Path] = set()
+    session_stamp: str | None = None
+    print(f"Monitoring {url} every {settings.poll_seconds}s", flush=True)
     while True:
         try:
             info = stream_info(settings, url)
             live = bool(info.get("is_live") and info.get("record_url"))
             if live and not active:
-                active, announced = True, False
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                prefix = room_dir / f"{stamp}_segment"
+                active = True
+                session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                prefix = room_dir / f"{session_stamp}_segment"
                 command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", info["record_url"],
                            "-c", "copy", "-f", "segment", "-segment_time", str(settings.segment_seconds),
                            "-reset_timestamps", "1", f"{prefix}_%03d.ts"]
                 process = subprocess.Popen(command)
                 send_text(settings, f"【开播】{info.get('anchor_name', url)}\n{info.get('title', '')}\n{url}")
+                print(f"Live started: {url} ({session_stamp})", flush=True)
             if active and not live:
                 if process:
                     process.terminate()
                     process.wait(timeout=30)
-                for segment in sorted(room_dir.glob("*_segment_*.ts")):
-                    if segment not in handled and segment.stat().st_size >= 1024:
-                        handled.add(segment)
-                        transcribe(segment, settings)
+                pattern = f"{session_stamp}_segment_*.ts"
+                segments = [segment for segment in sorted(room_dir.glob(pattern))
+                            if segment.stat().st_size >= 1024]
                 transcripts = []
-                for segment in sorted(room_dir.glob("*_segment_*.ts")):
-                    if segment.stat().st_size >= 1024:
-                        handled.add(segment)
-                        transcripts.append(transcribe(segment, settings))
+                for segment in segments:
+                    transcripts.append(transcribe(segment, settings))
                 full = "\n\n".join(text for text in transcripts if text)
                 full_path = room_dir / f"{datetime.now():%Y%m%d_%H%M%S}_full.txt"
                 full_path.write_text(full, encoding="utf-8")
-                first_segment = sorted(handled)[0] if handled else None
+                first_segment = segments[0] if segments else None
                 message = f"【下播，完整逐字稿】{url}\n共 {len(full)} 字。\n{full}"
                 # Keep the first 15-minute segment as the requested highlight. Feishu
                 # Webhook has message-size limits, so long transcripts are sent in chunks.
@@ -185,7 +183,8 @@ def run_room(settings: Settings, url: str) -> None:
                         send_text(settings, f"【开头15分钟片段】{url}\n本地文件：{first_segment}")
                 for offset in range(0, len(message), 6000):
                     send_text(settings, message[offset:offset + 6000])
-                active, process, handled = False, None, set()
+                print(f"Live finished: {url}; {len(segments)} segments, {len(full)} chars", flush=True)
+                active, process, session_stamp = False, None, None
             time.sleep(settings.poll_seconds)
         except Exception as exc:
             print(f"{url}: {exc}", flush=True)
@@ -203,7 +202,8 @@ def main() -> None:
                         recipient_open_ids=cfg.get("feishu_open_ids", []),
                         recipients=cfg.get("feishu_recipients", []),
                         poll_seconds=int(cfg.get("poll_seconds", 60)),
-                        segment_seconds=900, whisper_model=cfg.get("whisper_model", "small"),
+                        segment_seconds=int(cfg.get("segment_seconds", 900)),
+                        whisper_model=cfg.get("whisper_model", "small"),
                         whisper_language=cfg.get("whisper_language", "zh"), proxy=cfg.get("proxy", ""),
                         cookie=cfg.get("douyin_cookie", ""))
     settings.output_dir.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,6 @@
 # 双账号直播摘要服务
 
-`live_digest_service.py` 固定监控 `xhls8888` 和 `569306820`，每场直播按 900 秒分段录制。开播立即发送飞书文本通知；下播后用本地 Whisper 转写全部分段、合并完整逐字稿，再推送完整文本和开头 15 分钟的视频片段。
+`live_digest_service.py` 按配置监控一个或多个抖音直播间，默认每场直播按 900 秒分段录制。开播立即发送飞书文本通知；下播后用本地 Whisper 转写全部分段、合并完整逐字稿，再推送完整文本和开头 15 分钟的视频片段。
 
 ## 环境
 
@@ -16,4 +16,4 @@ Whisper 模型可改为 `tiny`、`base`、`small`、`medium`；中文通常从 `
 
 推荐安装到 `/opt/douyin-live-monitor`。真实的 `live_digest.json` 含 App Secret，不纳入 Git；服务器上单独创建并限制为仅服务用户可读。仓库附带 `live-digest.service`，用于 systemd 开机启动和异常重启。
 
-当前飞书推送目标：覃洋、何秦、王宁，使用各自的 `user_id`。
+真实飞书接收人应只写入未纳入 Git 的 `live_digest.json`。
