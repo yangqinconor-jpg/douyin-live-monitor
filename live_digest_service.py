@@ -35,12 +35,21 @@ class Settings:
     cookie: str = ""
 
 
+def feishu_response_data(response: requests.Response) -> dict[str, Any]:
+    """Fail on Feishu business errors, which can still use an HTTP 200 response."""
+    response.raise_for_status()
+    data = response.json()
+    if data.get("code", 0) != 0:
+        raise RuntimeError(f"Feishu API error {data.get('code')}: {data.get('msg', 'unknown error')}")
+    return data
+
+
 def feishu_text(webhook: str, text: str) -> None:
     if not webhook:
         print(text)
         return
     response = requests.post(webhook, json={"msg_type": "text", "content": {"text": text}}, timeout=20)
-    response.raise_for_status()
+    feishu_response_data(response)
 
 
 def send_text(settings: Settings, text: str) -> None:
@@ -59,7 +68,7 @@ def send_text(settings: Settings, text: str) -> None:
                       "content": json.dumps({"text": text}, ensure_ascii=False)},
                 timeout=30,
             )
-            response.raise_for_status()
+            feishu_response_data(response)
         return
     feishu_text(settings.webhook, text)
 
@@ -71,8 +80,7 @@ def tenant_token(settings: Settings) -> str | None:
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
         json={"app_id": settings.app_id, "app_secret": settings.app_secret}, timeout=20,
     )
-    response.raise_for_status()
-    data = response.json()
+    data = feishu_response_data(response)
     return data.get("tenant_access_token")
 
 
@@ -87,8 +95,7 @@ def upload_video(settings: Settings, path: Path) -> str | None:
             data={"file_type": "stream", "file_name": path.name, "file_size": str(path.stat().st_size)},
             files={"file": (path.name, video, "video/mp2t")}, timeout=300,
         )
-    response.raise_for_status()
-    return response.json().get("data", {}).get("file_key")
+    return feishu_response_data(response).get("data", {}).get("file_key")
 
 
 def feishu_file(settings: Settings, file_key: str, text: str) -> None:
@@ -107,7 +114,7 @@ def feishu_file(settings: Settings, file_key: str, text: str) -> None:
             json={"receive_id": receive_id, "msg_type": "file", "content": json.dumps({"file_key": file_key})},
             timeout=30,
         )
-        response.raise_for_status()
+        feishu_response_data(response)
     send_text(settings, text)
 
 
