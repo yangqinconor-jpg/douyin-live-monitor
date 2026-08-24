@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Monitor two Douyin rooms, record them, transcribe locally, and notify Feishu."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import requests
+
+
+@dataclass
+class Settings:
+    recorder_root: Path
+    output_dir: Path
+    webhook: str
+    app_id: str = ""
+    app_secret: str = ""
+    chat_id: str = ""
+    recipient_open_ids: list[str] | None = None
+    recipients: list[dict[str, str]] | None = None
+    poll_seconds: int = 60
+    segment_seconds: int = 900
+    whisper_model: str = "small"
+    whisper_language: str = "zh"
+    proxy: str = ""
+    cookie: str = ""
+
+
+def feishu_text(webhook: str, text: str) -> None:
+    if not webhook:
+        print(text)
+        return
+    response = requests.post(webhook, json={"msg_type": "text", "content": {"text": text}}, timeout=20)
+    response.raise_for_status()
+
+
+def send_text(settings: Settings, text: str) -> None:
+    """Send through the app bot when configured, otherwise use a webhook."""
+    token = tenant_token(settings)
+    targets = [("open_id", value) for value in (settings.recipient_open_ids or []) if value]
+    targets.extend((item.get("id_type", "open_id"), item["id"]) for item in (settings.recipients or []) if item.get("id"))
+    if settings.chat_id:
+        targets.append(("chat_id", settings.chat_id))
+    if token and targets:
+        for receive_type, receive_id in targets:
+            response = requests.post(
+                f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"receive_id": receive_id, "msg_type": "text",
+                      "content": json.dumps({"text": text}, ensure_ascii=False)},
+                timeout=30,
+            )
+            response.raise_for_status()
+        return
+    feishu_text(settings.webhook, text)
+
+
+def tenant_token(settings: Settings) -> str | None:
+    if not settings.app_id or not settings.app_secret:
+        return None
+    response = requests.post(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": settings.app_id, "app_secret": settings.app_secret}, timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data.get("tenant_access_token")
+
+
+def upload_video(settings: Settings, path: Path) -> str | None:
+    token = tenant_token(settings)
+    if not token:
+        return None
+    with path.open("rb") as video:
+        response = requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/files",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"file_type": "stream", "file_name": path.name, "file_size": str(path.stat().st_size)},
+            files={"file": (path.name, video, "video/mp2t")}, timeout=300,
+        )
+    response.raise_for_status()
+    return response.json().get("data", {}).get("file_key")
+
+
+def feishu_file(settings: Settings, file_key: str, text: str) -> None:
+    token = tenant_token(settings)
+    targets = [("open_id", value) for value in (settings.recipient_open_ids or []) if value]
+    targets.extend((item.get("id_type", "open_id"), item["id"]) for item in (settings.recipients or []) if item.get("id"))
+    if settings.chat_id:
+        targets.append(("chat_id", settings.chat_id))
+    if not token or not targets:
+        send_text(settings, text)
+        return
+    for receive_type, receive_id in targets:
+        response = requests.post(
+            f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"receive_id": receive_id, "msg_type": "file", "content": json.dumps({"file_key": file_key})},
+            timeout=30,
+        )
+        response.raise_for_status()
+    send_text(settings, text)
+
+
+def transcribe(path: Path, settings: Settings) -> str:
+    """Use openai-whisper's CLI; output is kept beside the media for recovery."""
+    out_dir = path.parent / "transcripts"
+    out_dir.mkdir(exist_ok=True)
+    stem = out_dir / path.stem
+    txt = stem.with_suffix(".txt")
+    if txt.exists():
+        return txt.read_text(encoding="utf-8")
+    wav = path.with_suffix(".wav")
+    subprocess.run(["ffmpeg", "-y", "-i", str(path), "-vn", "-ar", "16000", "-ac", "1", str(wav)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["whisper", str(wav), "--model", settings.whisper_model, "--language",
+                    settings.whisper_language, "--output_format", "txt", "--output_dir", str(out_dir)], check=True)
+    wav.unlink(missing_ok=True)
+    return txt.read_text(encoding="utf-8") if txt.exists() else ""
+
+
+def stream_info(settings: Settings, url: str) -> dict[str, Any]:
+    import sys
+    sys.path.insert(0, str(settings.recorder_root))
+    from src import spider, stream  # type: ignore
+    data = asyncio.run(spider.get_douyin_web_stream_data(url, proxy_addr=settings.proxy or None,
+                                                         cookies=settings.cookie or None))
+    return asyncio.run(stream.get_douyin_stream_url(data, "OD", settings.proxy or None))
+
+
+def run_room(settings: Settings, url: str) -> None:
+    room_dir = settings.output_dir / url.rstrip("/").split("/")[-1]
+    room_dir.mkdir(parents=True, exist_ok=True)
+    active = False
+    process: subprocess.Popen[bytes] | None = None
+    announced = False
+    handled: set[Path] = set()
+    while True:
+        try:
+            info = stream_info(settings, url)
+            live = bool(info.get("is_live") and info.get("record_url"))
+            if live and not active:
+                active, announced = True, False
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                prefix = room_dir / f"{stamp}_segment"
+                command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", info["record_url"],
+                           "-c", "copy", "-f", "segment", "-segment_time", str(settings.segment_seconds),
+                           "-reset_timestamps", "1", f"{prefix}_%03d.ts"]
+                process = subprocess.Popen(command)
+                send_text(settings, f"【开播】{info.get('anchor_name', url)}\n{info.get('title', '')}\n{url}")
+            if active and not live:
+                if process:
+                    process.terminate()
+                    process.wait(timeout=30)
+                for segment in sorted(room_dir.glob("*_segment_*.ts")):
+                    if segment not in handled and segment.stat().st_size >= 1024:
+                        handled.add(segment)
+                        transcribe(segment, settings)
+                transcripts = []
+                for segment in sorted(room_dir.glob("*_segment_*.ts")):
+                    if segment.stat().st_size >= 1024:
+                        handled.add(segment)
+                        transcripts.append(transcribe(segment, settings))
+                full = "\n\n".join(text for text in transcripts if text)
+                full_path = room_dir / f"{datetime.now():%Y%m%d_%H%M%S}_full.txt"
+                full_path.write_text(full, encoding="utf-8")
+                first_segment = sorted(handled)[0] if handled else None
+                message = f"【下播，完整逐字稿】{url}\n共 {len(full)} 字。\n{full}"
+                # Keep the first 15-minute segment as the requested highlight. Feishu
+                # Webhook has message-size limits, so long transcripts are sent in chunks.
+                if first_segment:
+                    key = upload_video(settings, first_segment)
+                    if key:
+                        feishu_file(settings, key, f"【开头15分钟片段】{url}\n完整逐字稿文件：{full_path}")
+                    else:
+                        send_text(settings, f"【开头15分钟片段】{url}\n本地文件：{first_segment}")
+                for offset in range(0, len(message), 6000):
+                    send_text(settings, message[offset:offset + 6000])
+                active, process, handled = False, None, set()
+            time.sleep(settings.poll_seconds)
+        except Exception as exc:
+            print(f"{url}: {exc}", flush=True)
+            time.sleep(settings.poll_seconds)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="live_digest.json")
+    args = parser.parse_args()
+    cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    settings = Settings(recorder_root=Path(cfg["recorder_root"]), output_dir=Path(cfg.get("output_dir", "./recordings")),
+                        webhook=cfg.get("feishu_webhook", ""), app_id=cfg.get("feishu_app_id", ""),
+                        app_secret=cfg.get("feishu_app_secret", ""), chat_id=cfg.get("feishu_chat_id", ""),
+                        recipient_open_ids=cfg.get("feishu_open_ids", []),
+                        recipients=cfg.get("feishu_recipients", []),
+                        poll_seconds=int(cfg.get("poll_seconds", 60)),
+                        segment_seconds=900, whisper_model=cfg.get("whisper_model", "small"),
+                        whisper_language=cfg.get("whisper_language", "zh"), proxy=cfg.get("proxy", ""),
+                        cookie=cfg.get("douyin_cookie", ""))
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    threads = [threading.Thread(target=run_room, args=(settings, url), daemon=False)
+               for url in cfg.get("rooms", [])]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+if __name__ == "__main__":
+    main()
