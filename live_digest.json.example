@@ -1,5 +1,5 @@
 {
-  "recorder_root": "/Users/conor/Desktop/抖音直播监控/DouyinLiveRecorder",
+  "recorder_root": "/opt/douyin-live-monitor/DouyinLiveRecorder",
   "output_dir": "./recordings",
   "rooms": [
     "https://live.douyin.com/xhls8888",
@@ -9,15 +9,14 @@
   "feishu_app_id": "",
   "feishu_app_secret": "",
   "feishu_chat_id": "",
-  "feishu_open_ids": ["ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
+  "feishu_open_ids": [],
   "feishu_recipients": [
-    {"name": "覃洋", "id_type": "user_id", "id": "746d187e"},
-    {"name": "何秦", "id_type": "user_id", "id": "68cgf442"},
-    {"name": "王宁", "id_type": "user_id", "id": "a6f9afa4"}
+    {"name": "接收人1", "id_type": "open_id", "id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}
   ],
   "whisper_model": "small",
   "whisper_language": "zh",
   "poll_seconds": 60,
+  "segment_seconds": 900,
   "proxy": "",
   "douyin_cookie": ""
 }
