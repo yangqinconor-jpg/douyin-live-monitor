@@ -31,6 +31,7 @@ class Settings:
     segment_seconds: int = 900
     whisper_model: str = "small"
     whisper_language: str = "zh"
+    transcription_mode: str = "server"
     proxy: str = ""
     cookie: str = ""
 
@@ -173,6 +174,21 @@ def run_room(settings: Settings, url: str) -> None:
                 pattern = f"{session_stamp}_segment_*.mp4"
                 segments = [segment for segment in sorted(room_dir.glob(pattern))
                             if segment.stat().st_size >= 1024]
+                if settings.transcription_mode == "local_pull":
+                    manifest = room_dir / f"{session_stamp}_pending_transcription.json"
+                    manifest.write_text(json.dumps({
+                        "session_id": session_stamp,
+                        "url": url,
+                        "anchor_name": info.get("anchor_name", url),
+                        "title": info.get("title", ""),
+                        "segments": [segment.name for segment in segments],
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                    }, ensure_ascii=False, indent=2), encoding="utf-8")
+                    send_text(settings, f"【下播】{info.get('anchor_name', url)}\n录像已保留，等本地电脑开机后将自动转录并推送。")
+                    print(f"Local transcription queued: {manifest}", flush=True)
+                    active, process, session_stamp = False, None, None
+                    time.sleep(settings.poll_seconds)
+                    continue
                 transcripts = []
                 for segment in segments:
                     transcripts.append(transcribe(segment, settings))
@@ -213,6 +229,7 @@ def main() -> None:
                         segment_seconds=int(cfg.get("segment_seconds", 900)),
                         whisper_model=cfg.get("whisper_model", "small"),
                         whisper_language=cfg.get("whisper_language", "zh"), proxy=cfg.get("proxy", ""),
+                        transcription_mode=cfg.get("transcription_mode", "server"),
                         cookie=cfg.get("douyin_cookie", ""))
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     threads = [threading.Thread(target=run_room, args=(settings, url), daemon=False)

@@ -15,6 +15,7 @@
   ],
   "whisper_model": "small",
   "whisper_language": "zh",
+  "transcription_mode": "local_pull",
   "poll_seconds": 60,
   "segment_seconds": 900,
   "proxy": "",

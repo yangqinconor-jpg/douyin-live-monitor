@@ -1,0 +1,12 @@
+{
+  "server": "ubuntu@YOUR_SERVER_IP",
+  "ssh_key": "/Users/YOUR_USER/.ssh/douyin_live_monitor_ed25519",
+  "remote_recordings_dir": "/opt/douyin-live-monitor/live-digest-service/recordings",
+  "local_output_dir": "./recordings-local",
+  "feishu_config": "live_digest.json",
+  "poll_seconds": 300,
+  "asr_model_path": "/Users/YOUR_USER/models/Qwen3-ASR-1.7B",
+  "asr_device": "mps",
+  "asr_language": "Chinese",
+  "asr_max_new_tokens": 8192
+}

@@ -2,14 +2,14 @@
 
 一个面向长期运行的抖音直播监控与内容交付服务。它使用
 [DouyinLiveRecorder](https://github.com/ihmily/DouyinLiveRecorder) 解析直播流，用 FFmpeg
-分段录制，下播后通过本地 Whisper 转写，并由飞书应用机器人通知指定用户。
+分段录制，下播后通过本地 Qwen3-ASR 转写，并由飞书应用机器人通知指定用户。
 
 ## 功能
 
 - 同时监控多个抖音直播间，默认每 60 秒轮询一次。
 - 检测到开播后，立即向多个飞书用户或群聊发送通知。
 - FFmpeg 按固定时长分段录制，默认每段 15 分钟。
-- 下播后用本地 OpenAI Whisper 转写全部分段。
+- 下播后由本地 Mac 上的 Qwen3-ASR 转写全部分段；Mac 关机时任务保留，开机后自动继续。
 - 合并整场逐字稿，分段发送到飞书，避免单条消息过长。
 - 上传本场直播的第一个 15 分钟视频分段。
 - 支持 systemd 开机自启、异常重启和日志查询。
@@ -27,7 +27,10 @@
                                       |
                                       +--> 检测下播
                                             |
-                                            +--> Whisper 逐段转写
+                                            +--> 写入待转写任务
+                                                  |
+                                                  +--> Mac 开机后拉取录像
+                                                        +--> 本地 Qwen3-ASR 逐段转写
                                             +--> 合并完整逐字稿
                                             +--> 飞书发送首段视频和逐字稿
 ```
@@ -54,8 +57,8 @@
 - Node.js（DouyinLiveRecorder 的签名解析依赖）
 - 建议至少 2 vCPU、4 GB 内存和足够的录播磁盘空间
 
-Whisper 使用 CPU 转写时可能比直播时长慢。`small` 模型适合中文精度优先的场景，
-较小的服务器可改用 `base` 或 `tiny`。首次转写会自动下载模型。
+云服务器只负责监控和录制。转写由本机已部署的 Qwen3-ASR 执行，既避免占用服务器资源，
+也获得更好的中文逐字稿质量。
 
 ## 快速安装
 
@@ -96,6 +99,7 @@ cp live_digest.json.example live_digest.json
 | `segment_seconds` | 录制分段时长 | `900` |
 | `whisper_model` | Whisper 模型 | `small` |
 | `whisper_language` | 转写语言 | `zh` |
+| `transcription_mode` | 转写执行位置：`server` 或 `local_pull` | `local_pull` |
 | `douyin_cookie` | 可选的抖音 Cookie，用于提高解析稳定性 | 字符串 |
 | `feishu_app_id` | 飞书应用 App ID | `cli_xxx` |
 | `feishu_app_secret` | 飞书应用 App Secret | 仅写入私密配置 |
@@ -123,6 +127,20 @@ cp live_digest.json.example live_digest.json
 只使用 Webhook 时可以发送文字，但直接通知个人和上传视频需要应用机器人。
 
 ## systemd 常驻运行
+
+## 本地 Qwen3-ASR 转写（推荐）
+
+如果不希望占用云服务器 CPU，将云端 `transcription_mode` 设为 `local_pull`。云端下播后仅写入 `*_pending_transcription.json`，Mac 开机后由 `local_transcriber.py` 通过 SSH 拉取 MP4，用本机 Qwen3-ASR 转写并推送飞书。
+
+```bash
+cd /opt/douyin-live-monitor/live-digest-service
+/path/to/qwen_env/bin/python local_transcriber.py --config local_transcriber.json --once
+```
+
+复制并填写 `local_transcriber.json.example` 后，把 `live_digest.json` 放在同一目录（只保存在本机）。
+其中 `asr_model_path` 指向本机的 Qwen3-ASR-1.7B 模型目录，运行 Python 必须是已安装 `qwen-asr` 的环境。
+macOS 可将仓库中的 `com.douyin-live-monitor.local-transcriber.plist` 复制到 `~/Library/LaunchAgents/`，即可在登录时自动启动；
+它每 5 分钟检查一次云端待转写任务。任务成功后云端清单会改名为 `.done`，避免重复推送。
 
 `live-digest.service` 默认使用下列路径：
 

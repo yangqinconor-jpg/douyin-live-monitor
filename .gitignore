@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv/
+.local-whisper-venv/
+local_transcriber.json

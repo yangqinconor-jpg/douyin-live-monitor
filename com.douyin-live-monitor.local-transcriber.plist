@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.douyin-live-monitor.local-transcriber</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/conor/Documents/Codex/2026-08-12/yo/work/qwen_env/bin/python</string>
+    <string>/Users/conor/Desktop/抖音直播监控/live-digest-service/local_transcriber.py</string>
+    <string>--config</string>
+    <string>/Users/conor/Desktop/抖音直播监控/live-digest-service/local_transcriber.json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/conor/Desktop/抖音直播监控/live-digest-service</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/conor/Desktop/抖音直播监控/live-digest-service/logs/local-transcriber.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/conor/Desktop/抖音直播监控/live-digest-service/logs/local-transcriber-error.log</string>
+</dict>
+</plist>
