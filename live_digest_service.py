@@ -93,7 +93,7 @@ def upload_video(settings: Settings, path: Path) -> str | None:
             "https://open.feishu.cn/open-apis/im/v1/files",
             headers={"Authorization": f"Bearer {token}"},
             data={"file_type": "stream", "file_name": path.name, "file_size": str(path.stat().st_size)},
-            files={"file": (path.name, video, "video/mp2t")}, timeout=300,
+            files={"file": (path.name, video, "video/mp4")}, timeout=300,
         )
     return feishu_response_data(response).get("data", {}).get("file_key")
 
@@ -161,7 +161,8 @@ def run_room(settings: Settings, url: str) -> None:
                 prefix = room_dir / f"{session_stamp}_segment"
                 command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", info["record_url"],
                            "-c", "copy", "-f", "segment", "-segment_time", str(settings.segment_seconds),
-                           "-reset_timestamps", "1", f"{prefix}_%03d.ts"]
+                           "-segment_format", "mp4", "-reset_timestamps", "1", "-movflags", "+faststart",
+                           f"{prefix}_%03d.mp4"]
                 process = subprocess.Popen(command)
                 send_text(settings, f"【开播】{info.get('anchor_name', url)}\n{info.get('title', '')}\n{url}")
                 print(f"Live started: {url} ({session_stamp})", flush=True)
@@ -169,7 +170,7 @@ def run_room(settings: Settings, url: str) -> None:
                 if process:
                     process.terminate()
                     process.wait(timeout=30)
-                pattern = f"{session_stamp}_segment_*.ts"
+                pattern = f"{session_stamp}_segment_*.mp4"
                 segments = [segment for segment in sorted(room_dir.glob(pattern))
                             if segment.stat().st_size >= 1024]
                 transcripts = []
