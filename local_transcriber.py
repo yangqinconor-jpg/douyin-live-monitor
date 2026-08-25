@@ -126,7 +126,8 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
         url=manifest.get("url", ""), transcript_length=len(full),
     )
     done_path = f"{manifest_path}.done"
-    run([*ssh_args(server, key), f"mv {shlex.quote(manifest_path)} {shlex.quote(done_path)}"], timeout=60)
+    # The cloud system service can own manifests under a dedicated account.
+    run([*ssh_args(server, key), f"sudo mv {shlex.quote(manifest_path)} {shlex.quote(done_path)}"], timeout=60)
     print(f"Completed local transcription: {full_path}", flush=True)
 
 
