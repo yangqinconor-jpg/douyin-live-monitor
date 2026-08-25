@@ -102,6 +102,15 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
     local_manifest = session_dir / Path(manifest_path).name
     run([*scp_args(key), f"{server}:{manifest_path}", str(local_manifest)], timeout=120)
     manifest = json.loads(local_manifest.read_text(encoding="utf-8"))
+    # Keep a local completion marker. The cloud manifest is archived only after
+    # publishing, so a permission/network error during archive must not resend
+    # an already delivered session on the next polling cycle.
+    published_marker = local_manifest.with_suffix(local_manifest.suffix + ".published")
+    if published_marker.exists():
+        done_path = f"{manifest_path}.done"
+        run([*ssh_args(server, key), f"sudo mv {shlex.quote(manifest_path)} {shlex.quote(done_path)}"], timeout=60)
+        print(f"Archived already-published transcription: {manifest_path}", flush=True)
+        return
     remote_dir = str(Path(manifest_path).parent)
     segments: list[Path] = []
     for name in manifest.get("segments", []):
@@ -124,6 +133,14 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
         settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
         session_id=manifest["session_id"], anchor=anchor, title=title,
         url=manifest.get("url", ""), transcript_length=len(full),
+    )
+    published_marker.write_text(
+        json.dumps({
+            "session_id": manifest.get("session_id"),
+            "published_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "transcript": str(full_path),
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
     done_path = f"{manifest_path}.done"
     # The cloud system service can own manifests under a dedicated account.
