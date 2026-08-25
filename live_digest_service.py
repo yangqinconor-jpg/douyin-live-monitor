@@ -221,6 +221,28 @@ def stream_info(settings: Settings, url: str) -> dict[str, Any]:
     return asyncio.run(stream.get_douyin_stream_url(data, "OD", settings.proxy or None))
 
 
+def start_recorder(
+    settings: Settings, room_dir: Path, account_id: str, session_stamp: str, record_url: str,
+) -> subprocess.Popen[bytes]:
+    """Start or resume a segmented recording without overwriting existing segments."""
+    video_base = artifact_path(room_dir, "直播视频", account_id, session_stamp, "")
+    existing = list(room_dir.glob(f"{video_base.name}_*.mp4"))
+    indices = []
+    for segment in existing:
+        try:
+            indices.append(int(segment.stem.rsplit("_", 1)[-1]))
+        except ValueError:
+            continue
+    next_index = max(indices, default=-1) + 1
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", record_url,
+        "-c", "copy", "-f", "segment", "-segment_time", str(settings.segment_seconds),
+        "-segment_format", "mp4", "-segment_start_number", str(next_index),
+        "-reset_timestamps", "1", "-movflags", "+faststart", f"{video_base}_%03d.mp4",
+    ]
+    return subprocess.Popen(command)
+
+
 def run_room(settings: Settings, url: str) -> None:
     account_id = url.rstrip("/").split("/")[-1]
     room_dir = settings.output_dir / account_id
@@ -236,14 +258,16 @@ def run_room(settings: Settings, url: str) -> None:
             if live and not active:
                 active = True
                 session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                video_base = artifact_path(room_dir, "直播视频", account_id, session_stamp, "")
-                command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", info["record_url"],
-                           "-c", "copy", "-f", "segment", "-segment_time", str(settings.segment_seconds),
-                           "-segment_format", "mp4", "-reset_timestamps", "1", "-movflags", "+faststart",
-                           f"{video_base}_%03d.mp4"]
-                process = subprocess.Popen(command)
+                process = start_recorder(settings, room_dir, account_id, session_stamp, info["record_url"])
                 send_text(settings, f"【开播】{info.get('anchor_name', url)}\n{info.get('title', '')}\n{url}")
                 print(f"Live started: {url} ({session_stamp})", flush=True)
+            elif live and active and process and process.poll() is not None:
+                exit_code = process.returncode
+                process = start_recorder(
+                    settings, room_dir, account_id, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    info["record_url"],
+                )
+                print(f"Recorder restarted: {url}; previous exit code {exit_code}", flush=True)
             if active and not live:
                 if process:
                     process.terminate()
