@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from live_digest_service import Settings, feishu_file, send_text, upload_video
+from live_digest_service import Settings, artifact_path, publish_finished_session
 
 
 _QWEN_MODEL: Any | None = None
@@ -114,19 +114,17 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
 
     transcripts = [transcribe_locally(segment, config) for segment in segments]
     full = "\n\n".join(text for text in transcripts if text)
-    full_path = session_dir / f"{manifest['session_id']}_full.txt"
+    account_id = manifest.get("account_id", Path(manifest_path).parent.name)
+    full_path = artifact_path(session_dir, "直播逐字稿", account_id, manifest["session_id"], ".txt")
     full_path.write_text(full, encoding="utf-8")
     first_segment = segments[0]
-    file_key = upload_video(settings, first_segment)
     title = manifest.get("title", "")
     anchor = manifest.get("anchor_name", manifest.get("url", ""))
-    if file_key:
-        feishu_file(settings, file_key, f"【开头15分钟片段】{anchor}\n{title}\n完整逐字稿已生成。")
-    else:
-        send_text(settings, f"【开头15分钟片段】{anchor}\n本地文件：{first_segment}")
-    message = f"【下播，完整逐字稿】{anchor}\n{manifest.get('url', '')}\n共 {len(full)} 字。\n{full}"
-    for offset in range(0, len(message), 6000):
-        send_text(settings, message[offset:offset + 6000])
+    publish_finished_session(
+        settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
+        session_id=manifest["session_id"], anchor=anchor, title=title,
+        url=manifest.get("url", ""), transcript_length=len(full),
+    )
     done_path = f"{manifest_path}.done"
     run([*ssh_args(server, key), f"mv {shlex.quote(manifest_path)} {shlex.quote(done_path)}"], timeout=60)
     print(f"Completed local transcription: {full_path}", flush=True)

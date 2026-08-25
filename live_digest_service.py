@@ -85,7 +85,8 @@ def tenant_token(settings: Settings) -> str | None:
     return data.get("tenant_access_token")
 
 
-def upload_video(settings: Settings, path: Path) -> str | None:
+def upload_file(settings: Settings, path: Path) -> str | None:
+    """Upload a message file. Feishu limits this endpoint to 30 MB."""
     token = tenant_token(settings)
     if not token:
         return None
@@ -94,9 +95,24 @@ def upload_video(settings: Settings, path: Path) -> str | None:
             "https://open.feishu.cn/open-apis/im/v1/files",
             headers={"Authorization": f"Bearer {token}"},
             data={"file_type": "stream", "file_name": path.name, "file_size": str(path.stat().st_size)},
-            files={"file": (path.name, video, "video/mp4")}, timeout=300,
+            files={"file": (path.name, video)}, timeout=300,
         )
     return feishu_response_data(response).get("data", {}).get("file_key")
+
+
+def upload_image(settings: Settings, path: Path) -> str | None:
+    """Upload a JPG screenshot for an inline Feishu image message."""
+    token = tenant_token(settings)
+    if not token:
+        return None
+    with path.open("rb") as image:
+        response = requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"image_type": "message"},
+            files={"image": (path.name, image, "image/jpeg")}, timeout=60,
+        )
+    return feishu_response_data(response).get("data", {}).get("image_key")
 
 
 def feishu_file(settings: Settings, file_key: str, text: str) -> None:
@@ -117,6 +133,66 @@ def feishu_file(settings: Settings, file_key: str, text: str) -> None:
         )
         feishu_response_data(response)
     send_text(settings, text)
+
+
+def feishu_image(settings: Settings, image_key: str) -> None:
+    token = tenant_token(settings)
+    targets = [("open_id", value) for value in (settings.recipient_open_ids or []) if value]
+    targets.extend((item.get("id_type", "open_id"), item["id"]) for item in (settings.recipients or []) if item.get("id"))
+    if settings.chat_id:
+        targets.append(("chat_id", settings.chat_id))
+    if not token or not targets:
+        return
+    for receive_type, receive_id in targets:
+        response = requests.post(
+            f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"receive_id": receive_id, "msg_type": "image",
+                  "content": json.dumps({"image_key": image_key})},
+            timeout=30,
+        )
+        feishu_response_data(response)
+
+
+def artifact_timestamp(session_id: str) -> str:
+    """Make the session start time readable while keeping it filename-safe."""
+    try:
+        return datetime.strptime(session_id, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d_%H-%M-%S")
+    except ValueError:
+        return session_id
+
+
+def artifact_path(directory: Path, kind: str, account_id: str, session_id: str, suffix: str) -> Path:
+    return directory / f"{kind}-{account_id}-{artifact_timestamp(session_id)}{suffix}"
+
+
+def capture_screenshot(video: Path, screenshot: Path) -> None:
+    """Capture a readable frame near the beginning of the first recording segment."""
+    subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "5", "-i", str(video),
+        "-frames:v", "1", "-vf", "scale='min(1280,iw)':-2", "-q:v", "3", str(screenshot),
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def publish_finished_session(
+    settings: Settings, *, first_segment: Path, transcript: Path, account_id: str,
+    session_id: str, anchor: str, title: str, url: str, transcript_length: int,
+) -> None:
+    """Send the requested screenshot and named transcript, never the oversized MP4."""
+    screenshot = artifact_path(transcript.parent, "直播截图", account_id, session_id, ".jpg")
+    capture_screenshot(first_segment, screenshot)
+    image_key = upload_image(settings, screenshot)
+    if image_key:
+        feishu_image(settings, image_key)
+    else:
+        send_text(settings, f"【直播截图】{anchor}\n本地文件：{screenshot}")
+
+    transcript_key = upload_file(settings, transcript)
+    caption = f"【下播，完整逐字稿】{anchor}\n{title}\n{url}\n共 {transcript_length} 字。"
+    if transcript_key:
+        feishu_file(settings, transcript_key, caption)
+    else:
+        send_text(settings, f"{caption}\n本地文件：{transcript}")
 
 
 def transcribe(path: Path, settings: Settings) -> str:
@@ -146,7 +222,8 @@ def stream_info(settings: Settings, url: str) -> dict[str, Any]:
 
 
 def run_room(settings: Settings, url: str) -> None:
-    room_dir = settings.output_dir / url.rstrip("/").split("/")[-1]
+    account_id = url.rstrip("/").split("/")[-1]
+    room_dir = settings.output_dir / account_id
     room_dir.mkdir(parents=True, exist_ok=True)
     active = False
     process: subprocess.Popen[bytes] | None = None
@@ -159,11 +236,11 @@ def run_room(settings: Settings, url: str) -> None:
             if live and not active:
                 active = True
                 session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                prefix = room_dir / f"{session_stamp}_segment"
+                video_base = artifact_path(room_dir, "直播视频", account_id, session_stamp, "")
                 command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", info["record_url"],
                            "-c", "copy", "-f", "segment", "-segment_time", str(settings.segment_seconds),
                            "-segment_format", "mp4", "-reset_timestamps", "1", "-movflags", "+faststart",
-                           f"{prefix}_%03d.mp4"]
+                           f"{video_base}_%03d.mp4"]
                 process = subprocess.Popen(command)
                 send_text(settings, f"【开播】{info.get('anchor_name', url)}\n{info.get('title', '')}\n{url}")
                 print(f"Live started: {url} ({session_stamp})", flush=True)
@@ -171,13 +248,14 @@ def run_room(settings: Settings, url: str) -> None:
                 if process:
                     process.terminate()
                     process.wait(timeout=30)
-                pattern = f"{session_stamp}_segment_*.mp4"
+                pattern = f"直播视频-{account_id}-{artifact_timestamp(session_stamp)}_*.mp4"
                 segments = [segment for segment in sorted(room_dir.glob(pattern))
                             if segment.stat().st_size >= 1024]
                 if settings.transcription_mode == "local_pull":
                     manifest = room_dir / f"{session_stamp}_pending_transcription.json"
                     manifest.write_text(json.dumps({
                         "session_id": session_stamp,
+                        "account_id": account_id,
                         "url": url,
                         "anchor_name": info.get("anchor_name", url),
                         "title": info.get("title", ""),
@@ -193,20 +271,15 @@ def run_room(settings: Settings, url: str) -> None:
                 for segment in segments:
                     transcripts.append(transcribe(segment, settings))
                 full = "\n\n".join(text for text in transcripts if text)
-                full_path = room_dir / f"{datetime.now():%Y%m%d_%H%M%S}_full.txt"
+                full_path = artifact_path(room_dir, "直播逐字稿", account_id, session_stamp or "unknown", ".txt")
                 full_path.write_text(full, encoding="utf-8")
                 first_segment = segments[0] if segments else None
-                message = f"【下播，完整逐字稿】{url}\n共 {len(full)} 字。\n{full}"
-                # Keep the first 15-minute segment as the requested highlight. Feishu
-                # Webhook has message-size limits, so long transcripts are sent in chunks.
                 if first_segment:
-                    key = upload_video(settings, first_segment)
-                    if key:
-                        feishu_file(settings, key, f"【开头15分钟片段】{url}\n完整逐字稿文件：{full_path}")
-                    else:
-                        send_text(settings, f"【开头15分钟片段】{url}\n本地文件：{first_segment}")
-                for offset in range(0, len(message), 6000):
-                    send_text(settings, message[offset:offset + 6000])
+                    publish_finished_session(
+                        settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
+                        session_id=session_stamp or "unknown", anchor=info.get("anchor_name", url),
+                        title=info.get("title", ""), url=url, transcript_length=len(full),
+                    )
                 print(f"Live finished: {url}; {len(segments)} segments, {len(full)} chars", flush=True)
                 active, process, session_stamp = False, None, None
             time.sleep(settings.poll_seconds)
