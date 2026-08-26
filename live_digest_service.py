@@ -597,26 +597,36 @@ def capture_screenshot(video: Path, screenshot: Path) -> None:
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def publish_finished_session(
-    settings: Settings, *, first_segment: Path, transcript: Path, account_id: str,
-    session_id: str, anchor: str, title: str, url: str, transcript_length: int,
-    recipients: list[dict[str, str]], ledger: DeliveryLedger,
-) -> None:
-    """Send the requested screenshot and named transcript, never the oversized MP4."""
-    screenshot = artifact_path(transcript.parent, "直播截图", anchor or account_id, session_id, ".jpg")
-    capture_screenshot(first_segment, screenshot)
-    image_key = upload_image(settings, screenshot)
-    if image_key:
-        feishu_image(settings, image_key, recipients=recipients, session_id=session_id, ledger=ledger)
-    else:
-        send_text(settings, f"【直播截图】{anchor}\n本地文件：{screenshot}", recipients=recipients, session_id=session_id, message_type="screenshot", ledger=ledger)
+def recording_complete_message(account_name: str, session_id: str, video_url: str, transcript_url: str,
+                               minute_url: str) -> str:
+    """Build the single post-processing notification required for a live session."""
+    try:
+        started = datetime.strptime(session_id, "%Y%m%d_%H%M%S")
+        started_label = f"{started.year}年{started.month}月{started.day}日 {started.hour}点{started.minute}"
+    except ValueError:
+        started_label = session_id
+    return (
+        "【直播录制完成提醒】\n"
+        f"“{account_name}”在“{started_label}”的直播录制已完成，请查收。\n"
+        f"录制视频：\n{video_url}\n"
+        f"文字记录：\n{transcript_url}\n"
+        f"智能纪要：\n{minute_url}"
+    )
 
-    transcript_key = upload_file(settings, transcript)
-    caption = f"【下播，完整逐字稿】{anchor}\n{title}\n{url}\n共 {transcript_length} 字。"
-    if transcript_key:
-        feishu_file(settings, transcript_key, caption, recipients=recipients, session_id=session_id, ledger=ledger)
-    else:
-        send_text(settings, f"{caption}\n本地文件：{transcript}", recipients=recipients, session_id=session_id, message_type="transcript", ledger=ledger)
+
+def publish_finished_session(
+    settings: Settings, *, account_name: str, session_id: str, video_url: str, transcript_url: str,
+    minute_url: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
+) -> None:
+    """Send one completion message, with all finished-session assets as links."""
+    send_text(
+        settings,
+        recording_complete_message(account_name, session_id, video_url, transcript_url, minute_url),
+        recipients=recipients,
+        session_id=session_id,
+        message_type="recording_complete",
+        ledger=ledger,
+    )
 
 
 def complete_with_feishu_minutes(
@@ -632,6 +642,7 @@ def complete_with_feishu_minutes(
 
     archive_folder = session_drive_folder(settings, account_name)
     video_token = upload_drive_file(settings, complete_video, archive_folder)
+    video_url = drive_file_url(video_token)
     minute_token, minute_url = upload_minutes(settings, video_token)
     transcript_text = wait_for_transcript(settings, minute_token)
     transcript_docx = artifact_path(room_dir, "直播逐字稿", account_name, session_id, ".docx")
@@ -640,8 +651,8 @@ def complete_with_feishu_minutes(
     transcript_url = drive_file_url(transcript_token)
 
     publish_finished_session(
-        settings, first_segment=complete_video, transcript=transcript_docx, account_id=account_name,
-        session_id=session_id, anchor=account_name, title=title, url=url, transcript_length=len(transcript_text),
+        settings, account_name=account_name, session_id=session_id, video_url=video_url,
+        transcript_url=transcript_url, minute_url=minute_url,
         recipients=recipients, ledger=ledger,
     )
     attach_session_artifacts(settings, record_id, screenshot, minute_url=minute_url, transcript_url=transcript_url)
@@ -826,9 +837,9 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 first_segment = segments[0] if segments else None
                 if first_segment:
                     publish_finished_session(
-                        settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
-                        session_id=session_stamp or "unknown", anchor=account.name,
-                        title=info.get("title", ""), url=url, transcript_length=len(full), recipients=snap_recipients, ledger=ledger,
+                        settings, account_name=snap_name, session_id=session_stamp or "unknown",
+                        video_url=str(first_segment), transcript_url=str(full_path), minute_url="",
+                        recipients=snap_recipients, ledger=ledger,
                     )
                     attach_session_artifacts(
                         settings, record_id,
