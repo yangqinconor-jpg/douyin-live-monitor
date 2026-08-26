@@ -62,6 +62,7 @@ class DeliveryLedger:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS deliveries (session_id TEXT, recipient_id TEXT, message_type TEXT, status TEXT, message_id TEXT, error TEXT, updated_at TEXT, PRIMARY KEY(session_id, recipient_id, message_type))")
             self.db.execute("CREATE TABLE IF NOT EXISTS sessions (account_id TEXT PRIMARY KEY, session_id TEXT, account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
 
     def claim(self, session_id: str, recipient_id: str, message_type: str) -> bool:
         with self.lock, self.db:
@@ -83,9 +84,21 @@ class DeliveryLedger:
             return None
         return {"session_id": row[0], "account_name": row[1], "recipients": json.loads(row[2]), "record_id": row[3], "started_ms": row[4]}
 
-    def start_session(self, account_id: str, session_id: str, account_name: str, recipients: list[dict[str, str]], record_id: str, started_ms: int) -> None:
+    def start_session(self, account_id: str, session_id: str, account_name: str, recipients: list[dict[str, str]], record_id: str, started_ms: int) -> bool:
         with self.lock, self.db:
+            blocked = self.db.execute("SELECT value FROM service_flags WHERE key='deployment_pending'").fetchone()
+            if blocked and blocked[0] == "1":
+                return False
             self.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,1) ON CONFLICT(account_id) DO UPDATE SET session_id=excluded.session_id, account_name=excluded.account_name, recipients=excluded.recipients, record_id=excluded.record_id, started_ms=excluded.started_ms, active=1", (account_id, session_id, account_name, json.dumps(recipients, ensure_ascii=False), record_id, started_ms))
+            return True
+
+    def set_session_record_id(self, account_id: str, record_id: str) -> None:
+        with self.lock, self.db:
+            self.db.execute("UPDATE sessions SET record_id=? WHERE account_id=? AND active=1", (record_id, account_id))
+
+    def set_deployment_pending(self, value: bool) -> None:
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO service_flags VALUES('deployment_pending', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ("1" if value else "0",))
 
     def end_session(self, account_id: str) -> None:
         with self.lock, self.db:
@@ -366,11 +379,6 @@ def artifact_path(directory: Path, kind: str, account_id: str, session_id: str, 
     return directory / f"{kind}-{account_id}-{artifact_timestamp(session_id)}{suffix}"
 
 
-def deployment_lock_path(settings: Settings) -> Path:
-    """A staged release keeps new sessions from starting until it is safe to restart."""
-    return Path(settings.state_db).resolve().parent / ".deployment-pending"
-
-
 def capture_screenshot(video: Path, screenshot: Path) -> None:
     """Capture a readable frame near the beginning of the first recording segment."""
     subprocess.run([
@@ -472,25 +480,19 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 update_account_state(settings, account, status="未使用")
                 time.sleep(settings.poll_seconds)
                 continue
-            # A safe deployment waits for active recordings to finish. While it
-            # waits, do not start a fresh session that would postpone the release.
-            if not active and deployment_lock_path(settings).exists():
-                time.sleep(settings.poll_seconds)
-                continue
             info = stream_info(settings, url)
             live = bool(info.get("is_live") and info.get("record_url"))
             if live and not active:
-                # The lock may have appeared while the stream information was
-                # being fetched, so check again immediately before recording.
-                if deployment_lock_path(settings).exists():
-                    time.sleep(settings.poll_seconds)
-                    continue
                 active = True
                 session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                process = start_recorder(settings, room_dir, account.name, session_stamp, info["record_url"])
                 started_ms = int(time.time() * 1000)
+                if not ledger.start_session(account_id, session_stamp, account.name, account.recipients, "", started_ms):
+                    active, session_stamp = False, None
+                    time.sleep(settings.poll_seconds)
+                    continue
+                process = start_recorder(settings, room_dir, account.name, session_stamp, info["record_url"])
                 record_id = create_live_record(settings, account, session_stamp, info.get("title", ""), started_ms, account.recipients)
-                ledger.start_session(account_id, session_stamp, account.name, account.recipients, record_id, started_ms)
+                ledger.set_session_record_id(account_id, record_id)
                 session_snapshot = {"account_name": account.name, "recipients": account.recipients, "record_id": record_id, "started_ms": started_ms}
                 update_account_state(settings, account, status="正常使用", started=started_ms)
                 send_text(settings, f"【开播】{account.name}\n{info.get('title', '')}\n{url}", recipients=account.recipients, session_id=session_stamp, message_type="live_start", ledger=ledger)
