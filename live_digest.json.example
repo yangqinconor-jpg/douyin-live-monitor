@@ -2,8 +2,7 @@
   "recorder_root": "/opt/douyin-live-monitor/DouyinLiveRecorder",
   "output_dir": "./recordings",
   "rooms": [
-    "https://live.douyin.com/xhls8888",
-    "https://live.douyin.com/569306820"
+    "https://live.douyin.com/example_live_id"
   ],
   "feishu_webhook": "",
   "feishu_app_id": "",

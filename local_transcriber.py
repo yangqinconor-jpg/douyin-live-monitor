@@ -131,18 +131,30 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
     full_path = artifact_path(session_dir, "直播逐字稿", account_name, manifest["session_id"], ".txt")
     full_path.write_text(full, encoding="utf-8")
     first_segment = segments[0]
-    title = manifest.get("title", "")
-    anchor = manifest.get("anchor_name", manifest.get("url", ""))
-    publish_finished_session(
-        settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
-        session_id=manifest["session_id"], anchor=account_name, title=title,
-        url=manifest.get("url", ""), transcript_length=len(full), recipients=recipients, ledger=ledger,
-    )
+    update_live_record(settings, manifest.get("record_id", ""), {
+        "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送中",
+    })
+    try:
+        publish_finished_session(
+            settings, account_name=account_name, session_id=manifest["session_id"],
+            video_url=str(first_segment), transcript_url=str(full_path), minute_url="",
+            video_name=first_segment.name, transcript_name=full_path.name,
+            recipients=recipients, ledger=ledger,
+        )
+    except Exception as exc:
+        update_live_record(settings, manifest.get("record_id", ""), {
+            "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送失败",
+            "失败原因": str(exc)[:1000],
+        })
+        raise
     attach_session_artifacts(
         settings, manifest.get("record_id", ""),
         artifact_path(session_dir, "直播截图", account_name, manifest["session_id"], ".jpg"),
     )
-    update_live_record(settings, manifest.get("record_id", ""), {"转写状态": "已完成", "推送状态": "已推送", "推送时间": int(time.time() * 1000)})
+    update_live_record(settings, manifest.get("record_id", ""), {
+        "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "已发送",
+        "完成提醒时间": int(time.time() * 1000), "失败原因": "",
+    })
     published_marker.write_text(
         json.dumps({
             "session_id": manifest.get("session_id"),
