@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -64,7 +65,7 @@ class DeliveryLedger:
     def claim(self, session_id: str, recipient_id: str, message_type: str) -> bool:
         with self.lock, self.db:
             row = self.db.execute("SELECT status FROM deliveries WHERE session_id=? AND recipient_id=? AND message_type=?", (session_id, recipient_id, message_type)).fetchone()
-            if row and row[0] in {"sent", "sending"}:
+            if row and row[0] == "sent":
                 return False
             self.db.execute("INSERT INTO deliveries VALUES(?,?,?,?,?,?,datetime('now')) ON CONFLICT(session_id,recipient_id,message_type) DO UPDATE SET status='sending', error=NULL, updated_at=datetime('now')", (session_id, recipient_id, message_type, "sending", "", ""))
             return True
@@ -85,6 +86,12 @@ def recipient_targets(recipients: list[dict[str, str]] | None) -> list[tuple[str
         seen.add(rid)
         result.append((item.get("id_type", "open_id"), rid, item.get("name", rid)))
     return result
+
+
+def message_url(receive_type: str, session_id: str, recipient_id: str, message_type: str) -> str:
+    """Use Feishu's request UUID so a transport retry cannot duplicate a message."""
+    key = hashlib.sha256(f"{session_id}:{recipient_id}:{message_type}".encode()).hexdigest()
+    return f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}&uuid={key}"
 
 
 def feishu_response_data(response: requests.Response) -> dict[str, Any]:
@@ -121,7 +128,8 @@ def send_text(settings: Settings, text: str, *, recipients: list[dict[str, str]]
             if ledger and session_id and not ledger.claim(session_id, receive_id, message_type):
                 continue
             try:
-                response = requests.post(f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}", headers={"Authorization": f"Bearer {token}"}, json={"receive_id": receive_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)}, timeout=30)
+                endpoint = message_url(receive_type, session_id, receive_id, message_type) if session_id else f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}"
+                response = requests.post(endpoint, headers={"Authorization": f"Bearer {token}"}, json={"receive_id": receive_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)}, timeout=30)
                 result = feishu_response_data(response)
                 if ledger and session_id:
                     ledger.finish(session_id, receive_id, message_type, result.get("data", {}).get("message_id", ""))
@@ -247,7 +255,7 @@ def feishu_file(settings: Settings, file_key: str, text: str, *, recipients: lis
             continue
         try:
             response = requests.post(
-            f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
+            message_url(receive_type, session_id, receive_id, "transcript") if session_id else f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
             headers={"Authorization": f"Bearer {token}"},
             json={"receive_id": receive_id, "msg_type": "file", "content": json.dumps({"file_key": file_key})},
             timeout=30,
@@ -279,7 +287,7 @@ def feishu_image(settings: Settings, image_key: str, *, recipients: list[dict[st
             continue
         try:
             response = requests.post(
-            f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
+            message_url(receive_type, session_id, receive_id, "screenshot") if session_id else f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
             headers={"Authorization": f"Bearer {token}"},
             json={"receive_id": receive_id, "msg_type": "image",
                   "content": json.dumps({"image_key": image_key})},
