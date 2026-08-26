@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from live_digest_service import (
     DeliveryLedger, Settings, artifact_path, attach_session_artifacts, concat_segments,
-    drive_file_url, message_url, recording_complete_message, session_segments, sync_accounts,
+    drive_file_url, message_url, recording_complete_message, recording_complete_post, session_segments, sync_accounts,
 )
 
 
@@ -105,6 +105,19 @@ class FeishuConfigTest(unittest.TestCase):
             "文字记录：\nhttps://transcript\n"
             "智能纪要：\nhttps://minutes"
         ))
+
+    def test_completion_post_uses_account_name_instead_of_source_file_name(self):
+        post = recording_complete_post(
+            "胡小群讲数学", "20260826_102012", "https://video", "https://transcript", "https://minutes",
+            "直播视频-胡小群讲数学-2026-08-26_10-20-12_00.mp4",
+            "直播逐字稿-胡小群讲数学-2026-08-26_10-20-12.docx",
+        )
+        link_labels = [line[0]["text"] for line in post["zh_cn"]["content"] if line[0]["tag"] == "a"]
+        self.assertEqual(link_labels, [
+            "直播视频-胡小群讲数学-2026-08-26_10-20-12_00.mp4",
+            "直播逐字稿-胡小群讲数学-2026-08-26_10-20-12.docx",
+            "智能纪要-胡小群讲数学-2026-08-26_10-20-12",
+        ])
 
     def test_deployment_gate_blocks_new_session_only_during_restart(self):
         with tempfile.TemporaryDirectory() as directory:

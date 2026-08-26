@@ -181,6 +181,43 @@ def send_text(settings: Settings, text: str, *, recipients: list[dict[str, str]]
     feishu_text(settings.webhook, text)
 
 
+def send_post(settings: Settings, content: dict[str, Any], fallback_text: str, *,
+              recipients: list[dict[str, str]] | None = None, session_id: str = "",
+              message_type: str = "post", ledger: DeliveryLedger | None = None) -> None:
+    """Send a rich-text post so link labels do not inherit old Drive file names."""
+    token = tenant_token(settings)
+    targets = recipient_targets(recipients if recipients is not None else settings.recipients)
+    if recipients is None:
+        targets.extend(("open_id", value, value) for value in (settings.recipient_open_ids or []) if value)
+    if settings.chat_id:
+        targets.append(("chat_id", settings.chat_id, settings.chat_id))
+    if not token or not targets:
+        feishu_text(settings.webhook, fallback_text)
+        return
+    seen: set[tuple[str, str]] = set()
+    for receive_type, receive_id, _ in targets:
+        if (receive_type, receive_id) in seen:
+            continue
+        seen.add((receive_type, receive_id))
+        if ledger and session_id and not ledger.claim(session_id, receive_id, message_type):
+            continue
+        try:
+            endpoint = message_url(receive_type, session_id, receive_id, message_type) if session_id else f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}"
+            response = requests.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {token}"},
+                json={"receive_id": receive_id, "msg_type": "post", "content": json.dumps(content, ensure_ascii=False)},
+                timeout=30,
+            )
+            result = feishu_response_data(response)
+            if ledger and session_id:
+                ledger.finish(session_id, receive_id, message_type, result.get("data", {}).get("message_id", ""))
+        except Exception as exc:
+            if ledger and session_id:
+                ledger.finish(session_id, receive_id, message_type, error=str(exc))
+            raise
+
+
 def tenant_token(settings: Settings) -> str | None:
     if not settings.app_id or not settings.app_secret:
         return None
@@ -614,13 +651,35 @@ def recording_complete_message(account_name: str, session_id: str, video_url: st
     )
 
 
+def recording_complete_post(account_name: str, session_id: str, video_url: str, transcript_url: str,
+                            minute_url: str, video_name: str, transcript_name: str) -> dict[str, Any]:
+    """Build a completion message with stable, account-name based link labels."""
+    try:
+        started = datetime.strptime(session_id, "%Y%m%d_%H%M%S")
+        started_label = f"{started.year}年{started.month}月{started.day}日 {started.hour}点{started.minute}"
+    except ValueError:
+        started_label = session_id
+    minute_name = f"智能纪要-{account_name}-{artifact_timestamp(session_id)}"
+    return {"zh_cn": {"title": "", "content": [
+        [{"tag": "text", "text": "【直播录制完成提醒】"}],
+        [{"tag": "text", "text": f"“{account_name}”在“{started_label}”的直播录制已完成，请查收。"}],
+        [{"tag": "text", "text": "录制视频："}],
+        [{"tag": "a", "text": video_name, "href": video_url}],
+        [{"tag": "text", "text": "文字记录："}],
+        [{"tag": "a", "text": transcript_name, "href": transcript_url}],
+        [{"tag": "text", "text": "智能纪要："}],
+        [{"tag": "a", "text": minute_name, "href": minute_url}],
+    ]}}
+
+
 def publish_finished_session(
     settings: Settings, *, account_name: str, session_id: str, video_url: str, transcript_url: str,
-    minute_url: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
+    minute_url: str, video_name: str, transcript_name: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
 ) -> None:
     """Send one completion message, with all finished-session assets as links."""
-    send_text(
+    send_post(
         settings,
+        recording_complete_post(account_name, session_id, video_url, transcript_url, minute_url, video_name, transcript_name),
         recording_complete_message(account_name, session_id, video_url, transcript_url, minute_url),
         recipients=recipients,
         session_id=session_id,
@@ -652,7 +711,8 @@ def complete_with_feishu_minutes(
 
     publish_finished_session(
         settings, account_name=account_name, session_id=session_id, video_url=video_url,
-        transcript_url=transcript_url, minute_url=minute_url,
+        transcript_url=transcript_url, minute_url=minute_url, video_name=complete_video.name,
+        transcript_name=transcript_docx.name,
         recipients=recipients, ledger=ledger,
     )
     attach_session_artifacts(settings, record_id, screenshot, minute_url=minute_url, transcript_url=transcript_url)
@@ -839,6 +899,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     publish_finished_session(
                         settings, account_name=snap_name, session_id=session_stamp or "unknown",
                         video_url=str(first_segment), transcript_url=str(full_path), minute_url="",
+                        video_name=first_segment.name, transcript_name=full_path.name,
                         recipients=snap_recipients, ledger=ledger,
                     )
                     attach_session_artifacts(
