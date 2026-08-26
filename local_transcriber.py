@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from live_digest_service import DeliveryLedger, Settings, artifact_path, publish_finished_session, update_live_record
+from live_digest_service import DeliveryLedger, Settings, artifact_path, attach_session_artifacts, publish_finished_session, update_live_record
 
 
 _QWEN_MODEL: Any | None = None
@@ -137,6 +137,10 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
         settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
         session_id=manifest["session_id"], anchor=account_name, title=title,
         url=manifest.get("url", ""), transcript_length=len(full), recipients=recipients, ledger=ledger,
+    )
+    attach_session_artifacts(
+        settings, manifest.get("record_id", ""),
+        artifact_path(session_dir, "直播截图", account_name, manifest["session_id"], ".jpg"), full_path,
     )
     update_live_record(settings, manifest.get("record_id", ""), {"转写状态": "已完成", "推送状态": "已推送", "推送时间": int(time.time() * 1000)})
     published_marker.write_text(

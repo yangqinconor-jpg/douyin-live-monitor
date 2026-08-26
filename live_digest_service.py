@@ -222,6 +222,33 @@ def update_live_record(settings: Settings, record_id: str, fields: dict[str, Any
         print(f"Live record update failed: {exc}", flush=True)
 
 
+def upload_bitable_attachment(settings: Settings, path: Path) -> str | None:
+    """Upload an artifact for a Bitable attachment field and return its token."""
+    token = tenant_token(settings)
+    if not token or not settings.bitable_app_token or not path.exists():
+        return None
+    with path.open("rb") as handle:
+        response = requests.post(
+            "https://open.feishu.cn/open-apis/drive/v1/medias/upload_all",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"file_name": path.name, "parent_type": "bitable_file", "parent_node": settings.bitable_app_token, "size": str(path.stat().st_size)},
+            files={"file": (path.name, handle)}, timeout=300,
+        )
+    return feishu_response_data(response).get("data", {}).get("file_token")
+
+
+def attach_session_artifacts(settings: Settings, record_id: str, screenshot: Path, transcript: Path) -> None:
+    fields: dict[str, Any] = {}
+    image_token = upload_bitable_attachment(settings, screenshot)
+    if image_token:
+        fields["截图"] = [{"file_token": image_token, "name": screenshot.name}]
+    transcript_token = upload_bitable_attachment(settings, transcript)
+    if transcript_token:
+        fields["逐字稿"] = [{"file_token": transcript_token, "name": transcript.name}]
+    if fields:
+        update_live_record(settings, record_id, fields)
+
+
 def upload_file(settings: Settings, path: Path) -> str | None:
     """Upload a message file. Feishu limits this endpoint to 30 MB."""
     token = tenant_token(settings)
@@ -499,6 +526,10 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                         settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
                         session_id=session_stamp or "unknown", anchor=account.name,
                         title=info.get("title", ""), url=url, transcript_length=len(full), recipients=snap_recipients, ledger=ledger,
+                    )
+                    attach_session_artifacts(
+                        settings, record_id,
+                        artifact_path(room_dir, "直播截图", snap_name, session_stamp or "unknown", ".jpg"), full_path,
                     )
                 update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "已完成", "推送状态": "已推送", "推送时间": int(time.time() * 1000)})
                 print(f"Live finished: {url}; {len(segments)} segments, {len(full)} chars", flush=True)
