@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from live_digest_service import (
     DeliveryLedger, Settings, artifact_path, attach_session_artifacts, concat_segments,
-    drive_file_url, message_url, session_segments, sync_accounts,
+    drive_file_url, message_url, recording_complete_message, session_segments, sync_accounts,
 )
 
 
@@ -93,6 +93,18 @@ class FeishuConfigTest(unittest.TestCase):
 
     def test_drive_file_link_is_clickable(self):
         self.assertEqual(drive_file_url("file-token"), "https://shenyidushu.feishu.cn/drive/file/file-token")
+
+    def test_completion_message_contains_all_three_finished_assets(self):
+        message = recording_complete_message(
+            "胡小群讲数学", "20260826_102012", "https://video", "https://transcript", "https://minutes",
+        )
+        self.assertEqual(message, (
+            "【直播录制完成提醒】\n"
+            "“胡小群讲数学”在“2026年8月26日 10点20”的直播录制已完成，请查收。\n"
+            "录制视频：\nhttps://video\n"
+            "文字记录：\nhttps://transcript\n"
+            "智能纪要：\nhttps://minutes"
+        ))
 
     def test_deployment_gate_blocks_new_session_only_during_restart(self):
         with tempfile.TemporaryDirectory() as directory:
