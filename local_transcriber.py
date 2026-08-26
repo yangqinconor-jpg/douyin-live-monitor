@@ -140,7 +140,7 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
     )
     attach_session_artifacts(
         settings, manifest.get("record_id", ""),
-        artifact_path(session_dir, "直播截图", account_name, manifest["session_id"], ".jpg"), full_path,
+        artifact_path(session_dir, "直播截图", account_name, manifest["session_id"], ".jpg"),
     )
     update_live_record(settings, manifest.get("record_id", ""), {"转写状态": "已完成", "推送状态": "已推送", "推送时间": int(time.time() * 1000)})
     published_marker.write_text(
