@@ -59,6 +59,10 @@ class Account:
     table_record_id: str = ""
 
 
+class CompletionNotificationError(RuntimeError):
+    """The recording was processed, but one or more completion messages failed."""
+
+
 class DeliveryLedger:
     """Durable per-session/per-recipient/per-message idempotency ledger."""
 
@@ -68,6 +72,7 @@ class DeliveryLedger:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS deliveries (session_id TEXT, recipient_id TEXT, message_type TEXT, status TEXT, message_id TEXT, error TEXT, updated_at TEXT, PRIMARY KEY(session_id, recipient_id, message_type))")
             self.db.execute("CREATE TABLE IF NOT EXISTS sessions (account_id TEXT PRIMARY KEY, session_id TEXT, account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS session_artifacts (session_id TEXT PRIMARY KEY, video_url TEXT, transcript_url TEXT, minute_url TEXT, video_name TEXT, transcript_name TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
 
     def claim(self, session_id: str, recipient_id: str, message_type: str) -> bool:
@@ -109,6 +114,21 @@ class DeliveryLedger:
     def end_session(self, account_id: str) -> None:
         with self.lock, self.db:
             self.db.execute("UPDATE sessions SET active=0 WHERE account_id=?", (account_id,))
+
+    def session_artifacts(self, session_id: str) -> dict[str, str] | None:
+        with self.lock:
+            row = self.db.execute("SELECT video_url, transcript_url, minute_url, video_name, transcript_name FROM session_artifacts WHERE session_id=?", (session_id,)).fetchone()
+        if not row:
+            return None
+        return dict(zip(("video_url", "transcript_url", "minute_url", "video_name", "transcript_name"), row))
+
+    def save_session_artifacts(self, session_id: str, *, video_url: str, transcript_url: str,
+                               minute_url: str, video_name: str, transcript_name: str) -> None:
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO session_artifacts VALUES(?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET video_url=excluded.video_url, transcript_url=excluded.transcript_url, minute_url=excluded.minute_url, video_name=excluded.video_name, transcript_name=excluded.transcript_name",
+                (session_id, video_url, transcript_url, minute_url, video_name, transcript_name),
+            )
 
 
 _USER_TOKEN_LOCK = threading.Lock()
@@ -161,6 +181,7 @@ def send_text(settings: Settings, text: str, *, recipients: list[dict[str, str]]
         # A recipient may be present in both legacy and named settings. Keep
         # one delivery target per id so a single event cannot fan out twice.
         seen: set[tuple[str, str]] = set()
+        errors: list[str] = []
         for receive_type, receive_id, _ in targets:
             if (receive_type, receive_id) in seen:
                 continue
@@ -176,7 +197,9 @@ def send_text(settings: Settings, text: str, *, recipients: list[dict[str, str]]
             except Exception as exc:
                 if ledger and session_id:
                     ledger.finish(session_id, receive_id, message_type, error=str(exc))
-                raise
+                errors.append(f"{receive_id}: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
         return
     feishu_text(settings.webhook, text)
 
@@ -195,6 +218,7 @@ def send_post(settings: Settings, content: dict[str, Any], fallback_text: str, *
         feishu_text(settings.webhook, fallback_text)
         return
     seen: set[tuple[str, str]] = set()
+    errors: list[str] = []
     for receive_type, receive_id, _ in targets:
         if (receive_type, receive_id) in seen:
             continue
@@ -215,7 +239,9 @@ def send_post(settings: Settings, content: dict[str, Any], fallback_text: str, *
         except Exception as exc:
             if ledger and session_id:
                 ledger.finish(session_id, receive_id, message_type, error=str(exc))
-            raise
+            errors.append(f"{receive_id}: {exc}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def tenant_token(settings: Settings) -> str | None:
@@ -329,7 +355,7 @@ def update_account_state(settings: Settings, account: Account, *, status: str, s
 
 def create_live_record(settings: Settings, account: Account, session_id: str, title: str, started: int, recipients: list[dict[str, str]]) -> str:
     label = f"【{account.name}】{datetime.fromtimestamp(started / 1000).strftime('%Y%m%d_%H%M')}-进行中"
-    fields = {"直播记录": label, "账号名称": account.name, "抖音号": account.account_id, "直播标题": title, "开播时间": started, "录制状态": "录制中", "转写状态": "待下载", "推送状态": "待推送", "任务 ID": session_id}
+    fields = {"直播记录": label, "账号名称": account.name, "抖音号": account.account_id, "直播标题": title, "开播时间": started, "录制状态": "录制中", "转写状态": "待转写", "完成提醒状态": "待发送", "任务 ID": session_id}
     data = bitable_request(settings, "POST", f"/bitable/v1/apps/{settings.bitable_app_token}/tables/{settings.record_table_id}/records", {"fields": fields})
     return data.get("data", {}).get("record", {}).get("record_id", "")
 
@@ -693,32 +719,57 @@ def complete_with_feishu_minutes(
     record_id: str, title: str, url: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
 ) -> None:
     """Create one complete video, archive it, transcribe it in Minutes, then publish once."""
-    complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
-    concat_segments(segments, complete_video)
     screenshot = artifact_path(room_dir, "直播截图", account_name, session_id, ".jpg")
-    capture_screenshot(complete_video, screenshot)
-    update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
+    completed = ledger.session_artifacts(session_id)
+    if completed:
+        video_url = completed["video_url"]
+        transcript_url = completed["transcript_url"]
+        minute_url = completed["minute_url"]
+        video_name = completed["video_name"]
+        transcript_name = completed["transcript_name"]
+    else:
+        complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
+        concat_segments(segments, complete_video)
+        capture_screenshot(complete_video, screenshot)
+        update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
 
-    archive_folder = session_drive_folder(settings, account_name)
-    video_token = upload_drive_file(settings, complete_video, archive_folder)
-    video_url = drive_file_url(video_token)
-    minute_token, minute_url = upload_minutes(settings, video_token)
-    transcript_text = wait_for_transcript(settings, minute_token)
-    transcript_docx = artifact_path(room_dir, "直播逐字稿", account_name, session_id, ".docx")
-    create_transcript_docx(transcript_docx, account_name, session_id, transcript_text)
-    transcript_token = upload_drive_file(settings, transcript_docx, archive_folder)
-    transcript_url = drive_file_url(transcript_token)
+        archive_folder = session_drive_folder(settings, account_name)
+        video_token = upload_drive_file(settings, complete_video, archive_folder)
+        video_url = drive_file_url(video_token)
+        minute_token, minute_url = upload_minutes(settings, video_token)
+        transcript_text = wait_for_transcript(settings, minute_token)
+        transcript_docx = artifact_path(room_dir, "直播逐字稿", account_name, session_id, ".docx")
+        create_transcript_docx(transcript_docx, account_name, session_id, transcript_text)
+        transcript_token = upload_drive_file(settings, transcript_docx, archive_folder)
+        transcript_url = drive_file_url(transcript_token)
+        video_name = complete_video.name
+        transcript_name = transcript_docx.name
+        ledger.save_session_artifacts(
+            session_id, video_url=video_url, transcript_url=transcript_url, minute_url=minute_url,
+            video_name=video_name, transcript_name=transcript_name,
+        )
 
-    publish_finished_session(
-        settings, account_name=account_name, session_id=session_id, video_url=video_url,
-        transcript_url=transcript_url, minute_url=minute_url, video_name=complete_video.name,
-        transcript_name=transcript_docx.name,
-        recipients=recipients, ledger=ledger,
-    )
     attach_session_artifacts(settings, record_id, screenshot, minute_url=minute_url, transcript_url=transcript_url)
     update_live_record(settings, record_id, {
-        "录制状态": "已完成", "转写状态": "已完成", "推送状态": "已推送",
-        "推送时间": int(time.time() * 1000), "失败原因": "",
+        "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送中",
+        "失败原因": "",
+    })
+    try:
+        publish_finished_session(
+            settings, account_name=account_name, session_id=session_id, video_url=video_url,
+            transcript_url=transcript_url, minute_url=minute_url, video_name=video_name,
+            transcript_name=transcript_name,
+            recipients=recipients, ledger=ledger,
+        )
+    except Exception as exc:
+        update_live_record(settings, record_id, {
+            "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送失败",
+            "失败原因": str(exc)[:1000],
+        })
+        raise CompletionNotificationError(str(exc)) from exc
+    update_live_record(settings, record_id, {
+        "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "已发送",
+        "完成提醒时间": int(time.time() * 1000), "失败原因": "",
     })
 
 
@@ -854,7 +905,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                         "created_at": datetime.now().isoformat(timespec="seconds"),
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
                     ended_ms = int(time.time() * 1000)
-                    update_live_record(settings, record_id, {"直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}", "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)), "录制状态": "已完成" if segments else "录制失败", "转写状态": "待下载", "推送状态": "待推送"})
+                    update_live_record(settings, record_id, {"直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}", "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)), "录制状态": "已完成" if segments else "录制失败", "转写状态": "待转写" if segments else "转写失败", "完成提醒状态": "待发送" if segments else "无需发送"})
                     ledger.end_session(account_id)
                     update_account_state(settings, account, status="正常使用", ended=ended_ms)
                     print(f"Local transcription queued: {manifest}", flush=True)
@@ -869,7 +920,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                         "录制状态": "已完成" if segments else "录制失败", "转写状态": "转写中" if segments else "转写失败",
                     })
                     if not segments:
-                        update_live_record(settings, record_id, {"失败原因": "下播后未发现有效录像分段", "推送状态": "未推送"})
+                        update_live_record(settings, record_id, {"失败原因": "下播后未发现有效录像分段", "完成提醒状态": "无需发送"})
                     else:
                         try:
                             complete_with_feishu_minutes(
@@ -877,9 +928,11 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                                 session_id=session_stamp or "unknown", record_id=record_id,
                                 title=info.get("title", ""), url=url, recipients=snap_recipients, ledger=ledger,
                             )
+                        except CompletionNotificationError:
+                            raise
                         except Exception as exc:
                             update_live_record(settings, record_id, {
-                                "转写状态": "转写失败", "推送状态": "未推送", "失败原因": str(exc)[:1000],
+                                "转写状态": "转写失败", "完成提醒状态": "无需发送", "失败原因": str(exc)[:1000],
                             })
                             raise
                     ledger.end_session(account_id)
@@ -906,7 +959,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                         settings, record_id,
                         artifact_path(room_dir, "直播截图", snap_name, session_stamp or "unknown", ".jpg"),
                     )
-                update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "已完成", "推送状态": "已推送", "推送时间": int(time.time() * 1000)})
+                update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "已发送", "完成提醒时间": int(time.time() * 1000)})
                 print(f"Live finished: {url}; {len(segments)} segments, {len(full)} chars", flush=True)
                 active, process, session_stamp, session_snapshot = False, None, None, None
             time.sleep(settings.poll_seconds)
