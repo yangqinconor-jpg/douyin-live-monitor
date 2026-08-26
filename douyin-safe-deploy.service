@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply a staged Douyin monitor release after live sessions finish
+After=network-online.target live-digest.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/douyin-live-monitor/live-digest-service
+ExecStart=/opt/douyin-live-monitor/live-digest-service/safe_apply_update.sh
+TimeoutStartSec=infinity
