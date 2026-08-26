@@ -3,7 +3,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from live_digest_service import DeliveryLedger, Settings, artifact_path, message_url, sync_accounts
+from live_digest_service import (
+    DeliveryLedger, Settings, artifact_path, attach_session_artifacts, concat_segments,
+    drive_file_url, message_url, session_segments, sync_accounts,
+)
 
 
 class DeliveryLedgerTest(unittest.TestCase):
@@ -45,6 +48,51 @@ class FeishuConfigTest(unittest.TestCase):
     def test_names_are_used_in_artifact_paths(self):
         path = artifact_path(Path("."), "直播逐字稿", "账号名称", "20260825_080020", ".txt")
         self.assertEqual(path.name, "直播逐字稿-账号名称-2026-08-25_08-00-20.txt")
+
+    def test_complete_video_name_uses_account_name_and_final_suffix(self):
+        path = artifact_path(Path("."), "直播视频", "胡小群讲数学", "20260826_100012", "_00.mp4")
+        self.assertEqual(path.name, "直播视频-胡小群讲数学-2026-08-26_10-00-12_00.mp4")
+
+    @patch("live_digest_service.subprocess.run")
+    def test_multiple_segments_are_merged_with_ffconcat(self, run):
+        run.return_value.returncode = 0
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            first = folder / "直播视频-胡小群讲数学-2026-08-26_10-00-12_000.mp4"
+            second = folder / "直播视频-胡小群讲数学-2026-08-26_10-00-12_001.mp4"
+            first.touch()
+            second.touch()
+            output = folder / "直播视频-胡小群讲数学-2026-08-26_10-00-12.mp4"
+            concat_segments([first, second], output)
+        command = run.call_args.args[0]
+        self.assertIn("concat", command)
+        self.assertIn("-c", command)
+        self.assertIn("copy", command)
+        self.assertEqual(command[-1], str(output))
+
+    def test_final_video_is_not_treated_as_an_unmerged_segment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            segment = folder / "直播视频-胡小群讲数学-2026-08-26_10-00-12_000.mp4"
+            final = folder / "直播视频-胡小群讲数学-2026-08-26_10-00-12_00.mp4"
+            segment.write_bytes(b"x" * 1024)
+            final.write_bytes(b"x" * 1024)
+            self.assertEqual(session_segments(folder, "胡小群讲数学", "20260826_100012"), [segment])
+
+    @patch("live_digest_service.update_live_record")
+    @patch("live_digest_service.upload_bitable_attachment", return_value="image-token")
+    def test_session_artifacts_write_minutes_and_docx_links(self, _upload, update):
+        attach_session_artifacts(
+            Settings(Path("."), Path("."), ""), "record", Path("screenshot.jpg"),
+            minute_url="https://shenyidushu.feishu.cn/minutes/example",
+            transcript_url="https://shenyidushu.feishu.cn/drive/file/example",
+        )
+        fields = update.call_args.args[2]
+        self.assertEqual(fields["智能纪要链接"]["link"], "https://shenyidushu.feishu.cn/minutes/example")
+        self.assertEqual(fields["文字记录链接"]["link"], "https://shenyidushu.feishu.cn/drive/file/example")
+
+    def test_drive_file_link_is_clickable(self):
+        self.assertEqual(drive_file_url("file-token"), "https://shenyidushu.feishu.cn/drive/file/file-token")
 
     def test_deployment_gate_blocks_new_session_only_during_restart(self):
         with tempfile.TemporaryDirectory() as directory:

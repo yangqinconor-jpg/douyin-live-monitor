@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -41,6 +42,11 @@ class Settings:
     record_table_id: str = ""
     config_poll_seconds: int = 60
     state_db: str = "./monitor_state.sqlite3"
+    feishu_user_token_path: str = ""
+    drive_root_folder_token: str = ""
+    drive_platform_folder_name: str = "抖音"
+    minutes_poll_seconds: int = 60
+    minutes_timeout_seconds: int = 7200
 
 
 @dataclass
@@ -103,6 +109,9 @@ class DeliveryLedger:
     def end_session(self, account_id: str) -> None:
         with self.lock, self.db:
             self.db.execute("UPDATE sessions SET active=0 WHERE account_id=?", (account_id,))
+
+
+_USER_TOKEN_LOCK = threading.Lock()
 
 
 def recipient_targets(recipients: list[dict[str, str]] | None) -> list[tuple[str, str, str]]:
@@ -183,11 +192,68 @@ def tenant_token(settings: Settings) -> str | None:
     return data.get("tenant_access_token")
 
 
+def app_access_token(settings: Settings) -> str:
+    if not settings.app_id or not settings.app_secret:
+        raise RuntimeError("Feishu application credentials are not configured")
+    response = requests.post(
+        "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal",
+        json={"app_id": settings.app_id, "app_secret": settings.app_secret}, timeout=20,
+    )
+    data = feishu_response_data(response)
+    token = data.get("app_access_token")
+    if not token:
+        raise RuntimeError("Feishu did not return an app access token")
+    return str(token)
+
+
 def bitable_request(settings: Settings, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     token = tenant_token(settings)
     if not token or not settings.bitable_app_token:
         raise RuntimeError("Bitable credentials are not configured")
     response = requests.request(method, f"https://open.feishu.cn/open-apis{path}", headers={"Authorization": f"Bearer {token}"}, json=body, timeout=30)
+    return feishu_response_data(response)
+
+
+def user_token(settings: Settings) -> str:
+    """Return the delegated token required by Feishu Minutes and Drive APIs."""
+    if not settings.feishu_user_token_path:
+        raise RuntimeError("Feishu user authorization token path is not configured")
+    token_path = Path(settings.feishu_user_token_path)
+    with _USER_TOKEN_LOCK:
+        try:
+            tokens = json.loads(token_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RuntimeError("Feishu user authorization is missing") from exc
+        expires_at = float(tokens.get("expires_at", 0))
+        if tokens.get("access_token") and expires_at > time.time() + 90:
+            return str(tokens["access_token"])
+        refresh_token = tokens.get("refresh_token")
+        if not refresh_token or not settings.app_id or not settings.app_secret:
+            raise RuntimeError("Feishu user authorization needs offline_access and a new authorization")
+        response = requests.post(
+            "https://open.feishu.cn/open-apis/authen/v1/oidc/refresh_access_token",
+            json={"grant_type": "refresh_token", "refresh_token": refresh_token,
+                  "app_access_token": app_access_token(settings)}, timeout=30,
+        )
+        data = feishu_response_data(response).get("data", {})
+        access_token = data.get("access_token")
+        if not access_token:
+            raise RuntimeError("Feishu did not return a refreshed user token")
+        tokens.update(data)
+        tokens["expires_at"] = time.time() + int(data.get("expires_in", 7200))
+        temporary = token_path.with_suffix(token_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(tokens, ensure_ascii=False), encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(token_path)
+        return str(access_token)
+
+
+def user_feishu_request(settings: Settings, method: str, path: str, *, body: dict[str, Any] | None = None,
+                        params: dict[str, Any] | None = None) -> dict[str, Any]:
+    response = requests.request(
+        method, f"https://open.feishu.cn/open-apis{path}", headers={"Authorization": f"Bearer {user_token(settings)}"},
+        json=body, params=params, timeout=60,
+    )
     return feishu_response_data(response)
 
 
@@ -255,16 +321,160 @@ def upload_bitable_attachment(settings: Settings, path: Path) -> str | None:
     return feishu_response_data(response).get("data", {}).get("file_token")
 
 
-def attach_session_artifacts(settings: Settings, record_id: str, screenshot: Path, transcript: Path) -> None:
+def attach_session_artifacts(settings: Settings, record_id: str, screenshot: Path, *, minute_url: str = "",
+                             transcript_url: str = "") -> None:
+    """Attach the screenshot and write the durable Feishu links for a session."""
     fields: dict[str, Any] = {}
     image_token = upload_bitable_attachment(settings, screenshot)
     if image_token:
         fields["截图"] = [{"file_token": image_token, "name": screenshot.name}]
-    transcript_token = upload_bitable_attachment(settings, transcript)
-    if transcript_token:
-        fields["逐字稿"] = [{"file_token": transcript_token, "name": transcript.name}]
+    if minute_url:
+        fields["智能纪要链接"] = {"link": minute_url, "text": "打开智能纪要"}
+    if transcript_url:
+        fields["文字记录链接"] = {"link": transcript_url, "text": "打开文字记录"}
     if fields:
         update_live_record(settings, record_id, fields)
+
+
+def concat_segments(segments: list[Path], output: Path) -> Path:
+    """Join recorder segments into the one complete MP4 that gets archived."""
+    if not segments:
+        raise RuntimeError("No recording segments to merge")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if len(segments) == 1:
+        if segments[0].resolve() != output.resolve():
+            subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(segments[0]),
+                            "-c", "copy", "-movflags", "+faststart", str(output)], check=True)
+        return output
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".ffconcat", delete=False) as handle:
+        concat_file = Path(handle.name)
+        for segment in segments:
+            # ffconcat requires single quotes to be escaped in file paths.
+            handle.write(f"file '{str(segment.resolve()).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\\n")
+    try:
+        fast_command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                        "-i", str(concat_file), "-c", "copy", "-movflags", "+faststart", str(output)]
+        copied = subprocess.run(fast_command, check=False)
+        if copied.returncode != 0:
+            subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                            "-i", str(concat_file), "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart",
+                            str(output)], check=True)
+    finally:
+        concat_file.unlink(missing_ok=True)
+    return output
+
+
+def drive_list(settings: Settings, folder_token: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    page_token = ""
+    while True:
+        params: dict[str, Any] = {"folder_token": folder_token, "page_size": 200}
+        if page_token:
+            params["page_token"] = page_token
+        data = user_feishu_request(settings, "GET", "/drive/v1/files", params=params).get("data", {})
+        items.extend(data.get("files", []))
+        if not data.get("has_more"):
+            return items
+        page_token = data.get("next_page_token", "")
+        if not page_token:
+            return items
+
+
+def ensure_drive_folder(settings: Settings, parent_token: str, name: str) -> str:
+    for item in drive_list(settings, parent_token):
+        if item.get("name") == name and item.get("type") == "folder":
+            return str(item.get("token"))
+    data = user_feishu_request(settings, "POST", "/drive/v1/files/create_folder",
+                               body={"name": name, "folder_token": parent_token})
+    token = data.get("data", {}).get("token")
+    if not token:
+        raise RuntimeError(f"Could not create Feishu folder: {name}")
+    return str(token)
+
+
+def session_drive_folder(settings: Settings, account_name: str) -> str:
+    if not settings.drive_root_folder_token:
+        raise RuntimeError("Feishu Drive root folder token is not configured")
+    platform = ensure_drive_folder(settings, settings.drive_root_folder_token, settings.drive_platform_folder_name)
+    account = ensure_drive_folder(settings, platform, account_name)
+    return ensure_drive_folder(settings, account, "直播录像")
+
+
+def drive_file_url(file_token: str) -> str:
+    return f"https://shenyidushu.feishu.cn/drive/file/{file_token}"
+
+
+def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
+    """Upload to a Drive folder with the multipart API, suitable for full MP4 files."""
+    if not path.is_file():
+        raise RuntimeError(f"Artifact does not exist: {path}")
+    prepared = user_feishu_request(settings, "POST", "/drive/v1/files/upload_prepare", body={
+        "file_name": path.name, "parent_type": "explorer", "parent_node": folder_token, "size": path.stat().st_size,
+    }).get("data", {})
+    upload_id = prepared.get("upload_id")
+    block_size = int(prepared.get("block_size", 0))
+    block_num = int(prepared.get("block_num", 0))
+    if not upload_id or block_size <= 0 or block_num <= 0:
+        raise RuntimeError("Feishu did not prepare the file upload")
+    token = user_token(settings)
+    with path.open("rb") as source:
+        for sequence in range(block_num):
+            block = source.read(block_size)
+            if not block:
+                raise RuntimeError("Recording ended before all upload blocks were read")
+            response = requests.post(
+                f"https://open.feishu.cn/open-apis/drive/v1/files/{upload_id}/upload_part",
+                headers={"Authorization": f"Bearer {token}"}, params={"seq": sequence},
+                files={"file": (path.name, block)}, timeout=300,
+            )
+            feishu_response_data(response)
+    finished = user_feishu_request(settings, "POST", "/drive/v1/files/upload_finish",
+                                   body={"upload_id": upload_id, "block_num": block_num}).get("data", {})
+    file_token = finished.get("file_token")
+    if not file_token:
+        raise RuntimeError("Feishu did not return the uploaded file token")
+    return str(file_token)
+
+
+def upload_minutes(settings: Settings, file_token: str) -> tuple[str, str]:
+    data = user_feishu_request(settings, "POST", "/minutes/v1/minutes/upload", body={"file_token": file_token}).get("data", {})
+    token = data.get("minute_token")
+    url = data.get("minute_url")
+    if not token or not url:
+        raise RuntimeError("Feishu did not create a Minutes record for this video")
+    return str(token), str(url)
+
+
+def wait_for_transcript(settings: Settings, minute_token: str) -> str:
+    deadline = time.monotonic() + settings.minutes_timeout_seconds
+    while time.monotonic() < deadline:
+        response = requests.get(
+            f"https://open.feishu.cn/open-apis/minutes/v1/minutes/{minute_token}/transcript",
+            headers={"Authorization": f"Bearer {user_token(settings)}"}, timeout=60,
+        )
+        if response.status_code == 200:
+            return response.text.strip()
+        try:
+            data = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise RuntimeError("Feishu Minutes returned an unreadable transcript response")
+        if data.get("code") != 2091003:
+            feishu_response_data(response)
+        time.sleep(settings.minutes_poll_seconds)
+    raise RuntimeError("Feishu Minutes transcription timed out")
+
+
+def create_transcript_docx(path: Path, account_name: str, session_id: str, transcript: str) -> Path:
+    from docx import Document
+
+    document = Document()
+    document.add_heading(f"{account_name} 直播逐字稿", level=1)
+    document.add_paragraph(f"直播开始时间：{artifact_timestamp(session_id)}")
+    for paragraph in transcript.splitlines():
+        document.add_paragraph(paragraph)
+    document.save(path)
+    return path
 
 
 def upload_file(settings: Settings, path: Path) -> str | None:
@@ -409,6 +619,38 @@ def publish_finished_session(
         send_text(settings, f"{caption}\n本地文件：{transcript}", recipients=recipients, session_id=session_id, message_type="transcript", ledger=ledger)
 
 
+def complete_with_feishu_minutes(
+    settings: Settings, *, room_dir: Path, segments: list[Path], account_name: str, session_id: str,
+    record_id: str, title: str, url: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
+) -> None:
+    """Create one complete video, archive it, transcribe it in Minutes, then publish once."""
+    complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
+    concat_segments(segments, complete_video)
+    screenshot = artifact_path(room_dir, "直播截图", account_name, session_id, ".jpg")
+    capture_screenshot(complete_video, screenshot)
+    update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
+
+    archive_folder = session_drive_folder(settings, account_name)
+    video_token = upload_drive_file(settings, complete_video, archive_folder)
+    minute_token, minute_url = upload_minutes(settings, video_token)
+    transcript_text = wait_for_transcript(settings, minute_token)
+    transcript_docx = artifact_path(room_dir, "直播逐字稿", account_name, session_id, ".docx")
+    create_transcript_docx(transcript_docx, account_name, session_id, transcript_text)
+    transcript_token = upload_drive_file(settings, transcript_docx, archive_folder)
+    transcript_url = drive_file_url(transcript_token)
+
+    publish_finished_session(
+        settings, first_segment=complete_video, transcript=transcript_docx, account_id=account_name,
+        session_id=session_id, anchor=account_name, title=title, url=url, transcript_length=len(transcript_text),
+        recipients=recipients, ledger=ledger,
+    )
+    attach_session_artifacts(settings, record_id, screenshot, minute_url=minute_url, transcript_url=transcript_url)
+    update_live_record(settings, record_id, {
+        "录制状态": "已完成", "转写状态": "已完成", "推送状态": "已推送",
+        "推送时间": int(time.time() * 1000), "失败原因": "",
+    })
+
+
 def transcribe(path: Path, settings: Settings) -> str:
     """Use openai-whisper's CLI; output is kept beside the media for recovery."""
     out_dir = path.parent / "transcripts"
@@ -440,7 +682,8 @@ def start_recorder(
 ) -> subprocess.Popen[bytes]:
     """Start or resume a segmented recording without overwriting existing segments."""
     video_base = artifact_path(room_dir, "直播视频", account_id, session_stamp, "")
-    existing = list(room_dir.glob(f"{video_base.name}_*.mp4"))
+    existing = [segment for segment in room_dir.glob(f"{video_base.name}_*.mp4")
+                if len(segment.stem.rsplit("_", 1)[-1]) == 3 and segment.stem.rsplit("_", 1)[-1].isdigit()]
     indices = []
     for segment in existing:
         try:
@@ -455,6 +698,15 @@ def start_recorder(
         "-reset_timestamps", "1", "-movflags", "+faststart", f"{video_base}_%03d.mp4",
     ]
     return subprocess.Popen(command)
+
+
+def session_segments(room_dir: Path, account_name: str, session_id: str) -> list[Path]:
+    """Return only temporary recorder segments, never the final merged MP4."""
+    prefix = f"直播视频-{account_name}-{artifact_timestamp(session_id)}_"
+    return [segment for segment in sorted(room_dir.glob(f"{prefix}*.mp4"))
+            if segment.stat().st_size >= 1024
+            and len(segment.stem.rsplit("_", 1)[-1]) == 3
+            and segment.stem.rsplit("_", 1)[-1].isdigit()]
 
 
 def run_room(settings: Settings, account_id: str, registry: dict[str, Account], registry_lock: threading.Lock, ledger: DeliveryLedger) -> None:
@@ -515,9 +767,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 snap_recipients = (session_snapshot or {}).get("recipients", account.recipients)
                 record_id = (session_snapshot or {}).get("record_id", "")
                 started_ms = (session_snapshot or {}).get("started_ms", int(time.time() * 1000))
-                pattern = f"直播视频-{snap_name}-{artifact_timestamp(session_stamp)}_*.mp4"
-                segments = [segment for segment in sorted(room_dir.glob(pattern))
-                            if segment.stat().st_size >= 1024]
+                segments = session_segments(room_dir, snap_name, session_stamp or "unknown")
                 if settings.transcription_mode == "local_pull":
                     manifest = room_dir / f"{session_stamp}_pending_transcription.json"
                     manifest.write_text(json.dumps({
@@ -540,6 +790,33 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     active, process, session_stamp = False, None, None
                     time.sleep(settings.poll_seconds)
                     continue
+                if settings.transcription_mode == "feishu_minutes":
+                    ended_ms = int(time.time() * 1000)
+                    update_live_record(settings, record_id, {
+                        "直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}",
+                        "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)),
+                        "录制状态": "已完成" if segments else "录制失败", "转写状态": "转写中" if segments else "转写失败",
+                    })
+                    if not segments:
+                        update_live_record(settings, record_id, {"失败原因": "下播后未发现有效录像分段", "推送状态": "未推送"})
+                    else:
+                        try:
+                            complete_with_feishu_minutes(
+                                settings, room_dir=room_dir, segments=segments, account_name=snap_name,
+                                session_id=session_stamp or "unknown", record_id=record_id,
+                                title=info.get("title", ""), url=url, recipients=snap_recipients, ledger=ledger,
+                            )
+                        except Exception as exc:
+                            update_live_record(settings, record_id, {
+                                "转写状态": "转写失败", "推送状态": "未推送", "失败原因": str(exc)[:1000],
+                            })
+                            raise
+                    ledger.end_session(account_id)
+                    update_account_state(settings, account, status="正常使用", ended=ended_ms)
+                    print(f"Feishu Minutes processing finished: {url}; {len(segments)} segments", flush=True)
+                    active, process, session_stamp, session_snapshot = False, None, None, None
+                    time.sleep(settings.poll_seconds)
+                    continue
                 transcripts = []
                 for segment in segments:
                     transcripts.append(transcribe(segment, settings))
@@ -555,7 +832,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     )
                     attach_session_artifacts(
                         settings, record_id,
-                        artifact_path(room_dir, "直播截图", snap_name, session_stamp or "unknown", ".jpg"), full_path,
+                        artifact_path(room_dir, "直播截图", snap_name, session_stamp or "unknown", ".jpg"),
                     )
                 update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "已完成", "推送状态": "已推送", "推送时间": int(time.time() * 1000)})
                 print(f"Live finished: {url}; {len(segments)} segments, {len(full)} chars", flush=True)
@@ -583,7 +860,12 @@ def main() -> None:
                         transcription_mode=cfg.get("transcription_mode", "server"),
                         cookie=cfg.get("douyin_cookie", ""), bitable_app_token=cfg.get("bitable_app_token", ""),
                         account_table_id=cfg.get("account_table_id", ""), record_table_id=cfg.get("record_table_id", ""),
-                        config_poll_seconds=int(cfg.get("config_poll_seconds", 60)), state_db=cfg.get("state_db", "./monitor_state.sqlite3"))
+                        config_poll_seconds=int(cfg.get("config_poll_seconds", 60)), state_db=cfg.get("state_db", "./monitor_state.sqlite3"),
+                        feishu_user_token_path=cfg.get("feishu_user_token_path", ""),
+                        drive_root_folder_token=cfg.get("drive_root_folder_token", ""),
+                        drive_platform_folder_name=cfg.get("drive_platform_folder_name", "抖音"),
+                        minutes_poll_seconds=int(cfg.get("minutes_poll_seconds", 60)),
+                        minutes_timeout_seconds=int(cfg.get("minutes_timeout_seconds", 7200)))
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     registry: dict[str, Account] = {}
     registry_lock = threading.Lock()

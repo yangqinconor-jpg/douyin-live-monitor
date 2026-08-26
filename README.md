@@ -2,16 +2,16 @@
 
 一个面向长期运行的抖音直播监控与内容交付服务。它使用
 [DouyinLiveRecorder](https://github.com/ihmily/DouyinLiveRecorder) 解析直播流，用 FFmpeg
-分段录制，下播后通过本地 Qwen3-ASR 转写，并由飞书应用机器人通知指定用户。
+分段录制，下播后合并完整录像，通过飞书妙记转写，并由飞书应用机器人通知指定用户。
 
 ## 功能
 
 - 同时监控多个抖音直播间，默认每 60 秒轮询一次。
 - 检测到开播后，立即向多个飞书用户或群聊发送通知。
 - FFmpeg 按固定时长分段录制，默认每段 15 分钟。
-- 下播后由本地 Mac 上的 Qwen3-ASR 转写全部分段；Mac 关机时任务保留，开机后自动继续。
-- 录像按 `直播视频-账号名称-直播时间-序号.mp4` 保存，逐字稿按
-  `直播逐字稿-账号名称-直播时间.txt` 保存。
+- 下播后先合并全部分段，完整录像上传到飞书云盘后由飞书妙记转写。
+- 录制中的临时片段带三位序号；最终合并录像为
+  `直播视频-账号名称-直播时间_00.mp4`，文字记录为 `直播逐字稿-账号名称-直播时间.docx`。
 - 下播后生成 `直播截图-账号名称-直播时间.jpg`，并把截图和完整逐字稿作为飞书消息推送。
 - 支持 systemd 开机自启、异常重启和日志查询。
 
@@ -19,7 +19,7 @@
 
 线上监控服务会定时读取服务器 `live_digest.json` 中的飞书多维表格配置，自动同步“监控账号列表”
 中的启用账号、账号名称、直播间链接和接收人。服务会创建和更新每场“直播记录”，并写入状态、
-失败原因、截图和逐字稿附件。
+失败原因、截图、智能纪要链接和文字记录链接。
 
 推荐的管理方式是：在“监控账号列表”维护账号和接收人，在“直播记录”查看每一场直播的处理结果。
 首次部署时需要在 `live_digest.json` 填写多维表格 App Token、表 ID 和数据表 ID；之后账号列表的
@@ -48,14 +48,15 @@
 `【胡小群讲数学】20260825_0800-1035`。字段包括：
 
 `直播记录`、`账号名称`、`抖音号`、`直播标题`、`开播时间`、`下播时间`、`直播时长（分钟）`、
-`录制状态`、`转写状态`、`推送状态`、`截图`、`逐字稿`、`原始录像链接`、`推送时间`、
+`录制状态`、`转写状态`、`推送状态`、`截图`、`智能纪要链接`、`文字记录链接`、`推送时间`、
 `失败原因`、`任务 ID`。
 
 - `录制状态`：`待录制`、`录制中`、`已完成`、`部分录制`、`录制失败`。
 - `转写状态`：`待下载`、`下载中`、`转写中`、`已完成`、`转写失败`。
 - `推送状态`：`待推送`、`推送中`、`已推送`、`推送失败`。
 - `任务 ID` 使用场次开始时间，作为重试、排障和幂等判断依据。
-- `原始录像链接` 当前暂留空；录像文件保存在服务器和本地转写目录。
+- `智能纪要链接` 直达飞书妙记；`文字记录链接` 直达归档的 DOCX。完整 MP4 和 DOCX
+  归档在飞书云盘 `直播监控台/抖音/账号名称/直播录像`。
 
 账号名称变更只影响展示，抖音号负责关联；接收人变更不追溯已创建任务，已创建任务按接收人快照发送。
 
@@ -72,13 +73,11 @@
                                       |
                                       +--> 检测下播
                                             |
-                                            +--> 写入待转写任务
-                                                  |
-                                                  +--> Mac 开机后拉取录像
-                                                        +--> 本地 Qwen3-ASR 逐段转写
-                                            +--> 合并完整逐字稿
+                                            +--> 合并全部录像为完整 MP4
+                                            +--> 上传飞书云盘并提交飞书妙记
+                                            +--> 取得完整逐字稿并生成 DOCX
                                             +--> 生成直播截图
-                                            +--> 飞书发送截图和逐字稿附件
+                                            +--> 写回智能纪要、文字记录链接并推送
 ```
 
 ## 仓库结构
@@ -87,7 +86,7 @@
 .
 ├── live_digest_service.py   # 监控、录制、转写和飞书推送主程序
 ├── live_digest.json.example # 安全的配置模板
-├── local_transcriber.py     # 本地 Qwen3-ASR 转写 worker
+├── local_transcriber.py     # 旧的本地 Qwen3-ASR 兼容 worker
 ├── local_transcriber.json.example
 ├── live-digest.service      # systemd 服务文件
 ├── requirements.txt         # Python 依赖
@@ -105,8 +104,7 @@
 - Node.js（DouyinLiveRecorder 的签名解析依赖）
 - 建议至少 2 vCPU、4 GB 内存和足够的录播磁盘空间
 
-云服务器只负责监控和录制。转写由本机已部署的 Qwen3-ASR 执行，既避免占用服务器资源，
-也获得更好的中文逐字稿质量。
+云服务器负责监控、录制、完整文件归档和提交飞书妙记；无需等待本机开机或下载 MP4。
 
 ## 快速安装
 
@@ -146,12 +144,15 @@ cp live_digest.json.example live_digest.json
 | `segment_seconds` | 录制分段时长 | `900` |
 | `whisper_model` | Whisper 模型 | `small` |
 | `whisper_language` | 转写语言 | `zh` |
-| `transcription_mode` | 转写执行位置：`server` 或 `local_pull` | `local_pull` |
+| `transcription_mode` | 正式模式为 `feishu_minutes`；兼容 `server`、`local_pull` | `feishu_minutes` |
 | `douyin_cookie` | 可选的抖音 Cookie，用于提高解析稳定性 | 字符串 |
 | `feishu_app_id` | 飞书应用 App ID | `cli_xxx` |
 | `feishu_app_secret` | 飞书应用 App Secret | 仅写入私密配置 |
 | `feishu_recipients` | 多个用户接收目标 | 见配置模板 |
 | `feishu_chat_id` | 可选的群聊 ID | `oc_xxx` |
+| `feishu_user_token_path` | 覃洋飞书用户授权令牌的私密路径 | `/etc/douyin-live-monitor/feishu_user_tokens.json` |
+| `drive_root_folder_token` | “直播监控台”文件夹 token | 飞书云盘文件夹 token |
+| `minutes_poll_seconds` | 妙记转写结果轮询间隔 | `60` |
 
 `feishu_recipients` 支持 `open_id`、`user_id` 和 `union_id`：
 
@@ -206,15 +207,22 @@ GitHub 提交不会自动改动服务器。只有将已验证的 `main` 分支�
 1. 在飞书开放平台创建企业自建应用，并开启机器人能力。
 2. 开通发送消息和上传文件所需权限。
 3. 将应用发布，并把接收人加入应用的可用范围。
-4. 在服务器私密配置中填入 App ID、App Secret 和接收人 ID。
+4. 为飞书妙记流程同时开通 `drive:drive`、妙记上传与逐字稿读取权限，以及用户授权范围
+   `offline_access`。覃洋完成一次授权后，服务才能自动续期并长期运行。
+5. 在服务器私密配置中填入 App ID、App Secret 和接收人 ID。
+
+授权回调服务应以管理员身份保存令牌，但令牌文件须只交给 `douyin-live` 服务用户读取和写入；
+仓库的回调程序会在授权完成时自动设置为该归属。
 
 只使用 Webhook 时可以发送文字，但直接通知个人和上传视频需要应用机器人。
 
 ## systemd 常驻运行
 
-## 本地 Qwen3-ASR 转写（推荐）
+## 旧版本地 Qwen3-ASR 转写（兼容）
 
-如果不希望占用云服务器 CPU，将云端 `transcription_mode` 设为 `local_pull`。云端下播后仅写入 `*_pending_transcription.json`，Mac 开机后由 `local_transcriber.py` 通过 SSH 拉取 MP4，用本机 Qwen3-ASR 转写并推送飞书。
+正式环境应使用 `feishu_minutes`，不依赖本机开机。只有需要临时回退时，才将
+`transcription_mode` 设为 `local_pull`；云端会写入 `*_pending_transcription.json`，再由
+`local_transcriber.py` 从服务器拉取 MP4 并用本机 Qwen3-ASR 转写。
 
 ```bash
 cd /path/to/live-digest-service

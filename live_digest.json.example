@@ -15,7 +15,7 @@
   ],
   "whisper_model": "small",
   "whisper_language": "zh",
-  "transcription_mode": "local_pull",
+  "transcription_mode": "feishu_minutes",
   "poll_seconds": 60,
   "segment_seconds": 900,
   "proxy": "",
@@ -25,4 +25,9 @@
   ,"record_table_id": ""
   ,"config_poll_seconds": 60
   ,"state_db": "./monitor_state.sqlite3"
+  ,"feishu_user_token_path": "/etc/douyin-live-monitor/feishu_user_tokens.json"
+  ,"drive_root_folder_token": ""
+  ,"drive_platform_folder_name": "抖音"
+  ,"minutes_poll_seconds": 60
+  ,"minutes_timeout_seconds": 7200
 }
