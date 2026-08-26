@@ -61,6 +61,7 @@ class DeliveryLedger:
         self.lock = threading.Lock()
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS deliveries (session_id TEXT, recipient_id TEXT, message_type TEXT, status TEXT, message_id TEXT, error TEXT, updated_at TEXT, PRIMARY KEY(session_id, recipient_id, message_type))")
+            self.db.execute("CREATE TABLE IF NOT EXISTS sessions (account_id TEXT PRIMARY KEY, session_id TEXT, account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER)")
 
     def claim(self, session_id: str, recipient_id: str, message_type: str) -> bool:
         with self.lock, self.db:
@@ -74,6 +75,21 @@ class DeliveryLedger:
         status = "sent" if not error else "failed"
         with self.lock, self.db:
             self.db.execute("UPDATE deliveries SET status=?, message_id=?, error=?, updated_at=datetime('now') WHERE session_id=? AND recipient_id=? AND message_type=?", (status, message_id, error, session_id, recipient_id, message_type))
+
+    def active_session(self, account_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.db.execute("SELECT session_id, account_name, recipients, record_id, started_ms FROM sessions WHERE account_id=? AND active=1", (account_id,)).fetchone()
+        if not row:
+            return None
+        return {"session_id": row[0], "account_name": row[1], "recipients": json.loads(row[2]), "record_id": row[3], "started_ms": row[4]}
+
+    def start_session(self, account_id: str, session_id: str, account_name: str, recipients: list[dict[str, str]], record_id: str, started_ms: int) -> None:
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,1) ON CONFLICT(account_id) DO UPDATE SET session_id=excluded.session_id, account_name=excluded.account_name, recipients=excluded.recipients, record_id=excluded.record_id, started_ms=excluded.started_ms, active=1", (account_id, session_id, account_name, json.dumps(recipients, ensure_ascii=False), record_id, started_ms))
+
+    def end_session(self, account_id: str) -> None:
+        with self.lock, self.db:
+            self.db.execute("UPDATE sessions SET active=0 WHERE account_id=?", (account_id,))
 
 
 def recipient_targets(recipients: list[dict[str, str]] | None) -> list[tuple[str, str, str]]:
@@ -398,6 +414,10 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
     active = False
     process: subprocess.Popen[bytes] | None = None
     session_stamp: str | None = None
+    session_snapshot: dict[str, Any] | None = ledger.active_session(account_id)
+    if session_snapshot:
+        active = True
+        session_stamp = session_snapshot["session_id"]
     print(f"Monitoring {account_id} every {settings.poll_seconds}s", flush=True)
     while True:
         try:
@@ -419,6 +439,8 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 process = start_recorder(settings, room_dir, account.name, session_stamp, info["record_url"])
                 started_ms = int(time.time() * 1000)
                 record_id = create_live_record(settings, account, session_stamp, info.get("title", ""), started_ms, account.recipients)
+                ledger.start_session(account_id, session_stamp, account.name, account.recipients, record_id, started_ms)
+                session_snapshot = {"account_name": account.name, "recipients": account.recipients, "record_id": record_id, "started_ms": started_ms}
                 update_account_state(settings, account, status="正常使用", started=started_ms)
                 send_text(settings, f"【开播】{account.name}\n{info.get('title', '')}\n{url}", recipients=account.recipients, session_id=session_stamp, message_type="live_start", ledger=ledger)
                 print(f"Live started: {url} ({session_stamp})", flush=True)
@@ -429,11 +451,18 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     info["record_url"],
                 )
                 print(f"Recorder restarted: {url}; previous exit code {exit_code}", flush=True)
+            elif live and active and process is None:
+                snap_name = (session_snapshot or {}).get("account_name", account.name)
+                process = start_recorder(settings, room_dir, snap_name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"), info["record_url"])
             if active and not live:
                 if process:
                     process.terminate()
                     process.wait(timeout=30)
-                pattern = f"直播视频-{account.name}-{artifact_timestamp(session_stamp)}_*.mp4"
+                snap_name = (session_snapshot or {}).get("account_name", account.name)
+                snap_recipients = (session_snapshot or {}).get("recipients", account.recipients)
+                record_id = (session_snapshot or {}).get("record_id", "")
+                started_ms = (session_snapshot or {}).get("started_ms", int(time.time() * 1000))
+                pattern = f"直播视频-{snap_name}-{artifact_timestamp(session_stamp)}_*.mp4"
                 segments = [segment for segment in sorted(room_dir.glob(pattern))
                             if segment.stat().st_size >= 1024]
                 if settings.transcription_mode == "local_pull":
@@ -441,8 +470,8 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     manifest.write_text(json.dumps({
                         "session_id": session_stamp,
                         "account_id": account_id,
-                        "account_name": account.name,
-                        "recipient_snapshot": account.recipients,
+                        "account_name": snap_name,
+                        "recipient_snapshot": snap_recipients,
                         "record_id": record_id,
                         "url": url,
                         "anchor_name": account.name,
@@ -451,7 +480,8 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                         "created_at": datetime.now().isoformat(timespec="seconds"),
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
                     ended_ms = int(time.time() * 1000)
-                    update_live_record(settings, record_id, {"直播记录": f"【{account.name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}", "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)), "录制状态": "已完成" if segments else "录制失败", "转写状态": "待下载", "推送状态": "待推送"})
+                    update_live_record(settings, record_id, {"直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}", "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)), "录制状态": "已完成" if segments else "录制失败", "转写状态": "待下载", "推送状态": "待推送"})
+                    ledger.end_session(account_id)
                     update_account_state(settings, account, status="正常使用", ended=ended_ms)
                     print(f"Local transcription queued: {manifest}", flush=True)
                     active, process, session_stamp = False, None, None
@@ -468,11 +498,11 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     publish_finished_session(
                         settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
                         session_id=session_stamp or "unknown", anchor=account.name,
-                        title=info.get("title", ""), url=url, transcript_length=len(full), recipients=account.recipients, ledger=ledger,
+                        title=info.get("title", ""), url=url, transcript_length=len(full), recipients=snap_recipients, ledger=ledger,
                     )
                 update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "已完成", "推送状态": "已推送", "推送时间": int(time.time() * 1000)})
                 print(f"Live finished: {url}; {len(segments)} segments, {len(full)} chars", flush=True)
-                active, process, session_stamp = False, None, None
+                active, process, session_stamp, session_snapshot = False, None, None, None
             time.sleep(settings.poll_seconds)
         except Exception as exc:
             print(f"{account_id}: {exc}", flush=True)
