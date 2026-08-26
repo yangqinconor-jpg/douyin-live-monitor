@@ -591,6 +591,13 @@ def main() -> None:
                     with registry_lock:
                         registry.clear()
                         registry.update({a.account_id: a for a in accounts})
+                    # This column represents whether the monitoring service is
+                    # available for an account, not its transient live state.
+                    for account in accounts:
+                        update_account_state(
+                            settings, account,
+                            status="正常使用" if account.enabled else "未使用",
+                        )
                 except Exception as exc:
                     print(f"Account config sync failed: {exc}", flush=True)
             with registry_lock:
