@@ -194,7 +194,7 @@ GitHub 提交不会自动改动服务器。只有将已验证的 `main` 分支�
 
 不能直接在有直播录制时重启 `live-digest.service`：重启会终止当前 FFmpeg 进程，造成一场直播被拆成多段。
 项目提供 `safe_apply_update.sh` 与 `douyin-safe-deploy.service`。首次安装这两个文件后，日后只从干净的
-`main` 分支执行 `./deploy_main_safely.sh`：新版本先放入待发布区；系统识别到没有活动场次后才替换主程序并
+`main` 分支执行 `bash deploy_main_safely.sh`：新版本先放入待发布区；系统识别到没有活动场次后才替换主程序并
 重启服务。等待期间不会开始新的场次，因此不会无限推迟发布。
 
 `develop` 和功能分支永远不允许直接部署。紧急维护也应先确认没有活动场次；禁止在直播中执行
