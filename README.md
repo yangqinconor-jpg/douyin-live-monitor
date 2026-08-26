@@ -190,6 +190,16 @@ GitHub 提交不会自动改动服务器。只有将已验证的 `main` 分支�
 要部署的提交，最后更新服务器并重启 `live-digest.service`。普通代码提交、推送 `develop`、或创建功能分支
 均不会触发线上部署。
 
+### 不打断直播的安全发布
+
+不能直接在有直播录制时重启 `live-digest.service`：重启会终止当前 FFmpeg 进程，造成一场直播被拆成多段。
+项目提供 `safe_apply_update.sh` 与 `douyin-safe-deploy.service`。首次安装这两个文件后，日后只从干净的
+`main` 分支执行 `./deploy_main_safely.sh`：新版本先放入待发布区；系统识别到没有活动场次后才替换主程序并
+重启服务。等待期间不会开始新的场次，因此不会无限推迟发布。
+
+`develop` 和功能分支永远不允许直接部署。紧急维护也应先确认没有活动场次；禁止在直播中执行
+`sudo systemctl restart live-digest.service`。
+
 ## 飞书应用要求
 
 1. 在飞书开放平台创建企业自建应用，并开启机器人能力。
