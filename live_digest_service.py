@@ -61,7 +61,13 @@ def send_text(settings: Settings, text: str) -> None:
     if settings.chat_id:
         targets.append(("chat_id", settings.chat_id))
     if token and targets:
+        # A recipient may be present in both legacy and named settings. Keep
+        # one delivery target per id so a single event cannot fan out twice.
+        seen: set[tuple[str, str]] = set()
         for receive_type, receive_id in targets:
+            if (receive_type, receive_id) in seen:
+                continue
+            seen.add((receive_type, receive_id))
             response = requests.post(
                 f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
                 headers={"Authorization": f"Bearer {token}"},
@@ -94,7 +100,9 @@ def upload_file(settings: Settings, path: Path) -> str | None:
         response = requests.post(
             "https://open.feishu.cn/open-apis/im/v1/files",
             headers={"Authorization": f"Bearer {token}"},
-            data={"file_type": "stream", "file_name": path.name, "file_size": str(path.stat().st_size)},
+            # `file_size` is not accepted by this endpoint and turns an
+            # otherwise valid upload into a 400 business error.
+            data={"file_type": "stream", "file_name": path.name},
             files={"file": (path.name, video)}, timeout=300,
         )
     return feishu_response_data(response).get("data", {}).get("file_key")
@@ -124,7 +132,11 @@ def feishu_file(settings: Settings, file_key: str, text: str) -> None:
     if not token or not targets:
         send_text(settings, text)
         return
+    seen: set[tuple[str, str]] = set()
     for receive_type, receive_id in targets:
+        if (receive_type, receive_id) in seen:
+            continue
+        seen.add((receive_type, receive_id))
         response = requests.post(
             f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
             headers={"Authorization": f"Bearer {token}"},
@@ -132,7 +144,8 @@ def feishu_file(settings: Settings, file_key: str, text: str) -> None:
             timeout=30,
         )
         feishu_response_data(response)
-    send_text(settings, text)
+    # The attachment itself is the transcript delivery. Do not call
+    # send_text here: that used to create a duplicate notification per user.
 
 
 def feishu_image(settings: Settings, image_key: str) -> None:
@@ -143,7 +156,11 @@ def feishu_image(settings: Settings, image_key: str) -> None:
         targets.append(("chat_id", settings.chat_id))
     if not token or not targets:
         return
+    seen: set[tuple[str, str]] = set()
     for receive_type, receive_id in targets:
+        if (receive_type, receive_id) in seen:
+            continue
+        seen.add((receive_type, receive_id))
         response = requests.post(
             f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_type}",
             headers={"Authorization": f"Bearer {token}"},
