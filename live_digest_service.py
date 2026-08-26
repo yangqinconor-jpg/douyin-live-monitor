@@ -131,8 +131,10 @@ def send_text(settings: Settings, text: str, *, recipients: list[dict[str, str]]
     """Send through the app bot when configured, otherwise use a webhook."""
     token = tenant_token(settings)
     targets = recipient_targets(recipients if recipients is not None else settings.recipients)
+    if recipients is None:
+        targets.extend(("open_id", value, value) for value in (settings.recipient_open_ids or []) if value)
     if settings.chat_id:
-        targets.append(("chat_id", settings.chat_id))
+        targets.append(("chat_id", settings.chat_id, settings.chat_id))
     if token and targets:
         # A recipient may be present in both legacy and named settings. Keep
         # one delivery target per id so a single event cannot fan out twice.
@@ -185,7 +187,10 @@ def sync_accounts(settings: Settings) -> list[Account]:
         if not account_id:
             continue
         enabled = fields.get("监控开关") == "启用"
-        url = fields.get("直播间链接") or f"https://live.douyin.com/{account_id}"
+        url_value = fields.get("直播间链接")
+        if isinstance(url_value, dict):
+            url_value = url_value.get("link") or url_value.get("text")
+        url = str(url_value or f"https://live.douyin.com/{account_id}")
         users = fields.get("监控接收人") or []
         recipients = [{"name": u.get("name", ""), "id_type": "open_id", "id": u.get("id", "")} for u in users if u.get("id")]
         accounts.append(Account(account_id, str(fields.get("监控账号", account_id)), url, enabled, recipients, item.get("record_id", item.get("id", ""))))
@@ -284,8 +289,10 @@ def upload_image(settings: Settings, path: Path) -> str | None:
 def feishu_file(settings: Settings, file_key: str, text: str, *, recipients: list[dict[str, str]] | None = None, session_id: str = "", ledger: DeliveryLedger | None = None) -> None:
     token = tenant_token(settings)
     targets = recipient_targets(recipients if recipients is not None else settings.recipients)
+    if recipients is None:
+        targets.extend(("open_id", value, value) for value in (settings.recipient_open_ids or []) if value)
     if settings.chat_id:
-        targets.append(("chat_id", settings.chat_id))
+        targets.append(("chat_id", settings.chat_id, settings.chat_id))
     if not token or not targets:
         send_text(settings, text)
         return
@@ -317,8 +324,10 @@ def feishu_file(settings: Settings, file_key: str, text: str, *, recipients: lis
 def feishu_image(settings: Settings, image_key: str, *, recipients: list[dict[str, str]] | None = None, session_id: str = "", ledger: DeliveryLedger | None = None) -> None:
     token = tenant_token(settings)
     targets = recipient_targets(recipients if recipients is not None else settings.recipients)
+    if recipients is None:
+        targets.extend(("open_id", value, value) for value in (settings.recipient_open_ids or []) if value)
     if settings.chat_id:
-        targets.append(("chat_id", settings.chat_id))
+        targets.append(("chat_id", settings.chat_id, settings.chat_id))
     if not token or not targets:
         return
     seen: set[tuple[str, str]] = set()

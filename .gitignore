@@ -9,3 +9,6 @@ __pycache__/
 .venv/
 .local-whisper-venv/
 local_transcriber.json
+monitor_state.sqlite3
+monitor_state.sqlite3-shm
+monitor_state.sqlite3-wal
