@@ -366,6 +366,11 @@ def artifact_path(directory: Path, kind: str, account_id: str, session_id: str, 
     return directory / f"{kind}-{account_id}-{artifact_timestamp(session_id)}{suffix}"
 
 
+def deployment_lock_path(settings: Settings) -> Path:
+    """A staged release keeps new sessions from starting until it is safe to restart."""
+    return Path(settings.state_db).resolve().parent / ".deployment-pending"
+
+
 def capture_screenshot(video: Path, screenshot: Path) -> None:
     """Capture a readable frame near the beginning of the first recording segment."""
     subprocess.run([
@@ -467,9 +472,19 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 update_account_state(settings, account, status="未使用")
                 time.sleep(settings.poll_seconds)
                 continue
+            # A safe deployment waits for active recordings to finish. While it
+            # waits, do not start a fresh session that would postpone the release.
+            if not active and deployment_lock_path(settings).exists():
+                time.sleep(settings.poll_seconds)
+                continue
             info = stream_info(settings, url)
             live = bool(info.get("is_live") and info.get("record_url"))
             if live and not active:
+                # The lock may have appeared while the stream information was
+                # being fetched, so check again immediately before recording.
+                if deployment_lock_path(settings).exists():
+                    time.sleep(settings.poll_seconds)
+                    continue
                 active = True
                 session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 process = start_recorder(settings, room_dir, account.name, session_stamp, info["record_url"])
