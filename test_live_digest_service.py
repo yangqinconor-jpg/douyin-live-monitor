@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from live_digest_service import DeliveryLedger, Settings, artifact_path, deployment_lock_path, message_url, sync_accounts
+from live_digest_service import DeliveryLedger, Settings, artifact_path, message_url, sync_accounts
 
 
 class DeliveryLedgerTest(unittest.TestCase):
@@ -46,11 +46,13 @@ class FeishuConfigTest(unittest.TestCase):
         path = artifact_path(Path("."), "直播逐字稿", "账号名称", "20260825_080020", ".txt")
         self.assertEqual(path.name, "直播逐字稿-账号名称-2026-08-25_08-00-20.txt")
 
-    def test_deployment_lock_lives_beside_state_database(self):
+    def test_deployment_gate_blocks_new_session_only_during_restart(self):
         with tempfile.TemporaryDirectory() as directory:
-            state_db = Path(directory) / "monitor_state.sqlite3"
-            settings = Settings(Path("."), Path("."), "", state_db=str(state_db))
-            self.assertEqual(deployment_lock_path(settings), (Path(directory) / ".deployment-pending").resolve())
+            ledger = DeliveryLedger(Path(directory) / "state.sqlite3")
+            ledger.set_deployment_pending(True)
+            self.assertFalse(ledger.start_session("account", "session", "名称", [], "", 123))
+            ledger.set_deployment_pending(False)
+            self.assertTrue(ledger.start_session("account", "session", "名称", [], "", 123))
 
     def test_message_uuid_is_stable_per_delivery(self):
         first = message_url("open_id", "session", "recipient", "screenshot")
