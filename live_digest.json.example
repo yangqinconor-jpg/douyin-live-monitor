@@ -20,4 +20,9 @@
   "segment_seconds": 900,
   "proxy": "",
   "douyin_cookie": ""
+  ,"bitable_app_token": ""
+  ,"account_table_id": ""
+  ,"record_table_id": ""
+  ,"config_poll_seconds": 60
+  ,"state_db": "./monitor_state.sqlite3"
 }

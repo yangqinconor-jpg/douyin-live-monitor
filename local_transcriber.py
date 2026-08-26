@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from live_digest_service import Settings, artifact_path, publish_finished_session
+from live_digest_service import DeliveryLedger, Settings, artifact_path, publish_finished_session, update_live_record
 
 
 _QWEN_MODEL: Any | None = None
@@ -89,7 +89,8 @@ def local_settings(config: dict[str, Any], config_dir: Path) -> Settings:
         recorder_root=Path("."), output_dir=output_dir, webhook=feishu.get("feishu_webhook", ""),
         app_id=feishu.get("feishu_app_id", ""), app_secret=feishu.get("feishu_app_secret", ""),
         chat_id=feishu.get("feishu_chat_id", ""), recipient_open_ids=feishu.get("feishu_open_ids", []),
-        recipients=feishu.get("feishu_recipients", []),
+        recipients=feishu.get("feishu_recipients", []), bitable_app_token=feishu.get("bitable_app_token", ""),
+        account_table_id=feishu.get("account_table_id", ""), record_table_id=feishu.get("record_table_id", ""),
     )
 
 
@@ -97,6 +98,7 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
     server = config["server"]
     key = Path(config["ssh_key"]).expanduser()
     settings = local_settings(config, config_dir)
+    ledger = DeliveryLedger((config_dir / config.get("state_db", "monitor_state.sqlite3")).resolve())
     session_dir = settings.output_dir / Path(manifest_path).parent.name
     session_dir.mkdir(parents=True, exist_ok=True)
     local_manifest = session_dir / Path(manifest_path).name
@@ -124,16 +126,19 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
     transcripts = [transcribe_locally(segment, config) for segment in segments]
     full = "\n\n".join(text for text in transcripts if text)
     account_id = manifest.get("account_id", Path(manifest_path).parent.name)
-    full_path = artifact_path(session_dir, "直播逐字稿", account_id, manifest["session_id"], ".txt")
+    account_name = manifest.get("account_name", account_id)
+    recipients = manifest.get("recipient_snapshot") or settings.recipients or []
+    full_path = artifact_path(session_dir, "直播逐字稿", account_name, manifest["session_id"], ".txt")
     full_path.write_text(full, encoding="utf-8")
     first_segment = segments[0]
     title = manifest.get("title", "")
     anchor = manifest.get("anchor_name", manifest.get("url", ""))
     publish_finished_session(
         settings, first_segment=first_segment, transcript=full_path, account_id=account_id,
-        session_id=manifest["session_id"], anchor=anchor, title=title,
-        url=manifest.get("url", ""), transcript_length=len(full),
+        session_id=manifest["session_id"], anchor=account_name, title=title,
+        url=manifest.get("url", ""), transcript_length=len(full), recipients=recipients, ledger=ledger,
     )
+    update_live_record(settings, manifest.get("record_id", ""), {"转写状态": "已完成", "推送状态": "已推送", "推送时间": int(time.time() * 1000)})
     published_marker.write_text(
         json.dumps({
             "session_id": manifest.get("session_id"),

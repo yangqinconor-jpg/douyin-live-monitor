@@ -9,4 +9,5 @@
   "asr_device": "mps",
   "asr_language": "Chinese",
   "asr_max_new_tokens": 8192
+  ,"state_db": "monitor_state.sqlite3"
 }
