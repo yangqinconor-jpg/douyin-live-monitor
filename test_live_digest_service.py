@@ -153,6 +153,35 @@ class FeishuConfigTest(unittest.TestCase):
         })
         self.assertNotIn("params", kwargs)
 
+    @patch("live_digest_service.user_feishu_request")
+    @patch("live_digest_service.user_token", return_value="token")
+    @patch("live_digest_service.requests.post")
+    def test_drive_upload_resumes_only_missing_parts(self, post, _token, request):
+        request.side_effect = [
+            {"data": {"upload_id": "upload", "block_size": 4, "block_num": 2}},
+            {"data": {"file_token": "file-token"}},
+        ]
+        success = unittest.mock.Mock()
+        success.raise_for_status.return_value = None
+        success.json.return_value = {"code": 0, "data": {}}
+        def first_attempt(*_args, **kwargs):
+            if kwargs["data"]["seq"] == "0":
+                return success
+            raise __import__("requests").exceptions.SSLError("offline")
+
+        post.side_effect = first_attempt
+        with tempfile.TemporaryDirectory() as directory, patch("live_digest_service.time.sleep"):
+            video = Path(directory) / "video.mp4"
+            video.write_bytes(b"12345678")
+            with self.assertRaises(__import__("requests").exceptions.SSLError):
+                upload_drive_file(Settings(Path("."), Path("."), ""), video, "folder")
+            post.reset_mock()
+            post.side_effect = [success]
+            self.assertEqual(upload_drive_file(Settings(Path("."), Path("."), ""), video, "folder"), "file-token")
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(post.call_args.kwargs["data"]["seq"], "1")
+            self.assertFalse((video.parent / f".{video.name}.feishu-upload.json").exists())
+
     def test_final_video_is_not_treated_as_an_unmerged_segment(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)

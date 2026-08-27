@@ -514,18 +514,54 @@ def drive_file_url(file_token: str) -> str:
     return f"https://shenyidushu.feishu.cn/drive/file/{file_token}"
 
 
+def _upload_checkpoint_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.feishu-upload.json")
+
+
+def _write_upload_checkpoint(checkpoint_path: Path, checkpoint: dict[str, Any]) -> None:
+    temporary = checkpoint_path.with_suffix(f"{checkpoint_path.suffix}.tmp")
+    temporary.write_text(json.dumps(checkpoint, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(checkpoint_path)
+
+
 def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
-    """Upload to a Drive folder with the multipart API, suitable for full MP4 files."""
+    """Upload a file with a durable per-part checkpoint for interrupted transfers."""
     if not path.is_file():
         raise RuntimeError(f"Artifact does not exist: {path}")
-    prepared = user_feishu_request(settings, "POST", "/drive/v1/files/upload_prepare", body={
-        "file_name": path.name, "parent_type": "explorer", "parent_node": folder_token, "size": path.stat().st_size,
-    }).get("data", {})
-    upload_id = prepared.get("upload_id")
-    block_size = int(prepared.get("block_size", 0))
-    block_num = int(prepared.get("block_num", 0))
-    if not upload_id or block_size <= 0 or block_num <= 0:
-        raise RuntimeError("Feishu did not prepare the file upload")
+    stat = path.stat()
+    checkpoint_path = _upload_checkpoint_path(path)
+    checkpoint: dict[str, Any] = {}
+    if checkpoint_path.is_file():
+        try:
+            candidate = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if (
+                candidate.get("file_size") == stat.st_size
+                and candidate.get("file_mtime_ns") == stat.st_mtime_ns
+                and candidate.get("folder_token") == folder_token
+            ):
+                checkpoint = candidate
+        except (OSError, ValueError, TypeError):
+            checkpoint = {}
+    if not checkpoint:
+        prepared = user_feishu_request(settings, "POST", "/drive/v1/files/upload_prepare", body={
+            "file_name": path.name, "parent_type": "explorer", "parent_node": folder_token, "size": stat.st_size,
+        }).get("data", {})
+        upload_id = prepared.get("upload_id")
+        block_size = int(prepared.get("block_size", 0))
+        block_num = int(prepared.get("block_num", 0))
+        if not upload_id or block_size <= 0 or block_num <= 0:
+            raise RuntimeError("Feishu did not prepare the file upload")
+        checkpoint = {
+            "upload_id": str(upload_id), "block_size": block_size, "block_num": block_num,
+            "file_size": stat.st_size, "file_mtime_ns": stat.st_mtime_ns, "folder_token": folder_token,
+            "completed_parts": [],
+        }
+        _write_upload_checkpoint(checkpoint_path, checkpoint)
+    upload_id = str(checkpoint["upload_id"])
+    block_size = int(checkpoint["block_size"])
+    block_num = int(checkpoint["block_num"])
+    completed_parts = {int(sequence) for sequence in checkpoint.get("completed_parts", [])}
+    checkpoint_lock = threading.Lock()
     token = user_token(settings)
 
     def upload_part(sequence: int) -> None:
@@ -548,19 +584,25 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
                     files={"file": (path.name, block)}, timeout=300,
                 )
                 feishu_response_data(response)
+                with checkpoint_lock:
+                    completed_parts.add(sequence)
+                    checkpoint["completed_parts"] = sorted(completed_parts)
+                    _write_upload_checkpoint(checkpoint_path, checkpoint)
                 return
             except requests.RequestException:
                 if attempt == 5:
                     raise
                 time.sleep(min(30, 2 ** attempt))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, block_num)) as executor:
-        list(executor.map(upload_part, range(block_num)))
+    pending_parts = [sequence for sequence in range(block_num) if sequence not in completed_parts]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(pending_parts) or 1)) as executor:
+        list(executor.map(upload_part, pending_parts))
     finished = user_feishu_request(settings, "POST", "/drive/v1/files/upload_finish",
                                    body={"upload_id": upload_id, "block_num": block_num}).get("data", {})
     file_token = finished.get("file_token")
     if not file_token:
         raise RuntimeError("Feishu did not return the uploaded file token")
+    checkpoint_path.unlink(missing_ok=True)
     return str(file_token)
 
 
