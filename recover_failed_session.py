@@ -56,7 +56,14 @@ def main() -> None:
         raise RuntimeError("Session snapshot was not found")
     account_name, recipients_json, record_id = row
     segments = sorted(Path(args.recovery_dir).glob("*.mp4"))
-    if not segments and not ledger.session_artifacts(args.session_id):
+    complete_video = service.artifact_path(
+        settings.output_dir / args.account_id, "直播视频", account_name, args.session_id, "_00.mp4",
+    )
+    if (
+        not segments
+        and not ledger.session_artifacts(args.session_id)
+        and not service.video_is_readable(complete_video)
+    ):
         raise RuntimeError("No recording segments or archived video checkpoint was found")
 
     print(
