@@ -225,16 +225,18 @@ class FeishuConfigTest(unittest.TestCase):
         self.assertNotIn("推送状态", fields)
 
     @patch("live_digest_service.update_live_record")
-    @patch("live_digest_service.upload_bitable_attachment", return_value="image-token")
-    def test_session_artifacts_write_minutes_and_docx_links(self, _upload, update):
+    def test_session_artifacts_write_minutes_and_docx_links(self, update):
         attach_session_artifacts(
-            Settings(Path("."), Path("."), ""), "record", Path("screenshot.jpg"),
+            Settings(Path("."), Path("."), ""), "record",
+            minutes_url="https://shenyidushu.feishu.cn/minutes/video",
             transcript_url="https://shenyidushu.feishu.cn/docx/transcript",
             summary_url="https://shenyidushu.feishu.cn/docx/summary",
         )
         fields = update.call_args.args[2]
+        self.assertEqual(fields["录制视频链接"]["link"], "https://shenyidushu.feishu.cn/minutes/video")
         self.assertEqual(fields["智能纪要链接"]["link"], "https://shenyidushu.feishu.cn/docx/summary")
         self.assertEqual(fields["文字记录链接"]["link"], "https://shenyidushu.feishu.cn/docx/transcript")
+        self.assertNotIn("截图", fields)
 
     def test_minutes_documents_are_matched_by_type_title_and_creation_time(self):
         files = [
@@ -353,9 +355,8 @@ class FeishuConfigTest(unittest.TestCase):
     @patch("live_digest_service.upload_drive_file", return_value="video-token")
     @patch("live_digest_service.drive_file_url", return_value="https://archive")
     @patch("live_digest_service.session_drive_folder", return_value="folder")
-    @patch("live_digest_service.capture_screenshot")
     @patch("live_digest_service.concat_segments")
-    def test_notification_retry_reuses_finished_artifacts(self, _concat, _screenshot, _folder, _url, uploads,
+    def test_notification_retry_reuses_finished_artifacts(self, _concat, _folder, _url, uploads,
                                                           _minutes, _documents, _publish, _readable, cleanup,
                                                           _attach, _update):
         with tempfile.TemporaryDirectory() as directory:
