@@ -214,7 +214,7 @@ class FeishuConfigTest(unittest.TestCase):
         self.assertEqual(fields["文字记录链接"]["link"], "https://shenyidushu.feishu.cn/drive/file/example")
 
     def test_drive_file_link_is_clickable(self):
-        self.assertEqual(drive_file_url("file-token"), "https://shenyidushu.feishu.cn/drive/file/file-token")
+        self.assertEqual(drive_file_url("file-token"), "https://shenyidushu.feishu.cn/file/file-token")
 
     @patch("live_digest_service.user_feishu_request")
     def test_minutes_token_is_derived_from_returned_url(self, request):

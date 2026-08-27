@@ -511,7 +511,7 @@ def session_drive_folder(settings: Settings, account_name: str) -> str:
 
 
 def drive_file_url(file_token: str) -> str:
-    return f"https://shenyidushu.feishu.cn/drive/file/{file_token}"
+    return f"https://shenyidushu.feishu.cn/file/{file_token}"
 
 
 def _upload_checkpoint_path(path: Path) -> Path:
