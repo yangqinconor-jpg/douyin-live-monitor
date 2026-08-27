@@ -4,8 +4,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from live_digest_service import (
-    Account, CompletionNotificationError, DeliveryLedger, Settings, artifact_path, attach_session_artifacts,
-    cleanup_uploaded_recordings, complete_with_feishu_minutes, concat_segments, create_live_record, drive_file_url, message_url,
+    Account, CompletionNotificationError, DeliveryLedger, LowDiskSpaceError, Settings, artifact_path,
+    attach_session_artifacts, cleanup_uploaded_recordings, complete_with_feishu_minutes, concat_segments,
+    create_live_record, drive_file_url, ensure_merge_space, message_url,
     recording_complete_message, recording_complete_post, send_post, session_segments, sync_accounts,
 )
 
@@ -107,6 +108,15 @@ class FeishuConfigTest(unittest.TestCase):
             self.assertFalse(second.exists())
             self.assertFalse(complete.exists())
             self.assertTrue(current_recording.exists())
+
+    @patch("live_digest_service.shutil.disk_usage")
+    def test_merge_waits_when_disk_cannot_hold_a_complete_copy(self, disk_usage):
+        with tempfile.TemporaryDirectory() as directory:
+            segment = Path(directory) / "segment.mp4"
+            segment.write_bytes(b"x" * 1024)
+            disk_usage.return_value = unittest.mock.Mock(free=1024)
+            with self.assertRaises(LowDiskSpaceError):
+                ensure_merge_space([segment], Path(directory), reserve_bytes=1024)
 
     def test_final_video_is_not_treated_as_an_unmerged_segment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -215,7 +225,9 @@ class FeishuConfigTest(unittest.TestCase):
             room = Path(directory)
             ledger = DeliveryLedger(room / "state.sqlite3")
             settings = Settings(Path("."), room, "")
-            args = dict(room_dir=room, segments=[room / "segment.mp4"], account_name="示例账号", session_id="20260826_100012", record_id="record", title="", url="", recipients=[], ledger=ledger)
+            segment = room / "segment.mp4"
+            segment.touch()
+            args = dict(room_dir=room, segments=[segment], account_name="示例账号", session_id="20260826_100012", record_id="record", title="", url="", recipients=[], ledger=ledger)
             with self.assertRaises(CompletionNotificationError):
                 complete_with_feishu_minutes(settings, **args)
             complete_with_feishu_minutes(settings, **args)

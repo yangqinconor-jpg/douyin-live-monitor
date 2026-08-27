@@ -15,6 +15,6 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 2
 fi
 
-scp -i "$SSH_KEY" live_digest_service.py "$SERVER:/tmp/live_digest_service.py.next"
-ssh -i "$SSH_KEY" "$SERVER" "sudo install -o douyin-live -g douyin-live -m 644 /tmp/live_digest_service.py.next '$REMOTE_DIR/live_digest_service.py.next' && sudo rm -f /tmp/live_digest_service.py.next && sudo systemctl start --no-block douyin-safe-deploy.service"
+scp -i "$SSH_KEY" live_digest_service.py safe_apply_update.sh "$SERVER:/tmp/"
+ssh -i "$SSH_KEY" "$SERVER" "sudo install -o douyin-live -g douyin-live -m 644 /tmp/live_digest_service.py '$REMOTE_DIR/live_digest_service.py.next' && sudo install -o root -g root -m 755 /tmp/safe_apply_update.sh '$REMOTE_DIR/safe_apply_update.sh' && sudo rm -f /tmp/live_digest_service.py /tmp/safe_apply_update.sh && sudo systemctl start --no-block douyin-safe-deploy.service"
 echo "Release staged. It will apply automatically after all active live sessions finish."

@@ -15,37 +15,50 @@ fi
 
 echo "Release staged. Waiting for active live sessions to finish."
 
-until /opt/douyin-live-monitor/.venv/bin/python - "$STATE_DB" <<'PY'
-import sqlite3
-import sys
-
-try:
-    conn = sqlite3.connect(sys.argv[1])
-    with conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
-        active = conn.execute("SELECT COUNT(*) FROM sessions WHERE active=1").fetchone()[0]
-        if active == 0:
-            conn.execute("INSERT INTO service_flags VALUES('deployment_pending', '1') ON CONFLICT(key) DO UPDATE SET value='1'")
-except Exception:
-    active = 1
-raise SystemExit(0 if active == 0 else 1)
-PY
-do
-  echo "A live session is still active; checking again in 60 seconds."
-  sleep 60
-done
-
-install -o douyin-live -g douyin-live -m 644 "$STAGED_FILE" "$TARGET_FILE"
-rm -f "$STAGED_FILE"
-systemctl restart "$SERVICE"
-systemctl is-active --quiet "$SERVICE"
-/opt/douyin-live-monitor/.venv/bin/python - "$STATE_DB" <<'PY'
+set_deployment_gate() {
+  /opt/douyin-live-monitor/.venv/bin/python - "$STATE_DB" "$1" <<'PY'
 import sqlite3
 import sys
 
 conn = sqlite3.connect(sys.argv[1])
 with conn:
     conn.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute("INSERT INTO service_flags VALUES('deployment_pending', '0') ON CONFLICT(key) DO UPDATE SET value='0'")
+    conn.execute("INSERT INTO service_flags VALUES('deployment_pending', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (sys.argv[2],))
 PY
+}
+
+recording_active() {
+  pgrep -af '[f]fmpeg' | grep -F -- '-f segment' | grep -Fq 'recordings/'
+}
+
+while true; do
+  while recording_active; do
+    echo "A recording process is still active; checking again in 60 seconds."
+    sleep 60
+  done
+
+  # Close the race where a new room starts between the process check and the
+  # restart. Existing recording workers are not affected by this gate.
+  set_deployment_gate 1
+  sleep 75
+  if recording_active; then
+    set_deployment_gate 0
+    continue
+  fi
+  break
+done
+
+trap 'set_deployment_gate 0' EXIT
+
+while pgrep -x ffmpeg >/dev/null; do
+  echo "Video processing is still active; checking again in 10 seconds."
+  sleep 10
+done
+
+install -o douyin-live -g douyin-live -m 644 "$STAGED_FILE" "$TARGET_FILE"
+rm -f "$STAGED_FILE"
+systemctl restart "$SERVICE"
+systemctl is-active --quiet "$SERVICE"
+set_deployment_gate 0
+trap - EXIT
 echo "Release applied successfully."
