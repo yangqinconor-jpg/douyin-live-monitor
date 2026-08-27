@@ -27,6 +27,11 @@ with conn:
 PY
 }
 
+# Recover from an interrupted previous deployment before waiting. Register the
+# cleanup trap before this process can ever raise the gate itself.
+trap 'set_deployment_gate 0' EXIT
+set_deployment_gate 0
+
 recording_active() {
   pgrep -af '[f]fmpeg' | grep -F -- '-f segment' | grep -Fq 'recordings/'
 }
@@ -66,8 +71,6 @@ while true; do
   fi
   break
 done
-
-trap 'set_deployment_gate 0' EXIT
 
 install -o douyin-live -g douyin-live -m 644 "$STAGED_FILE" "$TARGET_FILE"
 rm -f "$STAGED_FILE"
