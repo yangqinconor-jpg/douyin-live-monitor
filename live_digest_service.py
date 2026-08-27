@@ -82,16 +82,51 @@ class DeliveryLedger:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS deliveries (session_id TEXT, recipient_id TEXT, message_type TEXT, status TEXT, message_id TEXT, error TEXT, updated_at TEXT, PRIMARY KEY(session_id, recipient_id, message_type))")
             self.db.execute("CREATE TABLE IF NOT EXISTS sessions (account_id TEXT PRIMARY KEY, session_id TEXT, account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER)")
-            self.db.execute("CREATE TABLE IF NOT EXISTS session_artifacts (session_id TEXT PRIMARY KEY, video_url TEXT, transcript_url TEXT, minute_url TEXT, video_name TEXT, transcript_name TEXT)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS session_artifacts (session_id TEXT PRIMARY KEY, archive_video_url TEXT, minutes_url TEXT, transcript_url TEXT, summary_url TEXT, video_name TEXT, minutes_title TEXT, minutes_created_at INTEGER)")
             self.db.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(session_artifacts)")}
+            for name, definition in {
+                "archive_video_url": "TEXT", "minutes_url": "TEXT", "summary_url": "TEXT",
+                "minutes_title": "TEXT", "minutes_created_at": "INTEGER",
+            }.items():
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE session_artifacts ADD COLUMN {name} {definition}")
+            if "video_url" in columns:
+                self.db.execute(
+                    "UPDATE session_artifacts SET archive_video_url=video_url "
+                    "WHERE COALESCE(archive_video_url, '')=''"
+                )
+            if "minute_url" in columns:
+                self.db.execute(
+                    "UPDATE session_artifacts SET minutes_url=minute_url "
+                    "WHERE COALESCE(minutes_url, '')=''"
+                )
 
     def claim(self, session_id: str, recipient_id: str, message_type: str) -> bool:
-        with self.lock, self.db:
-            row = self.db.execute("SELECT status FROM deliveries WHERE session_id=? AND recipient_id=? AND message_type=?", (session_id, recipient_id, message_type)).fetchone()
-            if row and row[0] == "sent":
-                return False
-            self.db.execute("INSERT INTO deliveries VALUES(?,?,?,?,?,?,datetime('now')) ON CONFLICT(session_id,recipient_id,message_type) DO UPDATE SET status='sending', error=NULL, updated_at=datetime('now')", (session_id, recipient_id, message_type, "sending", "", ""))
-            return True
+        with self.lock:
+            try:
+                # BEGIN IMMEDIATE serializes claims across the service and any
+                # recovery worker that uses the same SQLite database.
+                self.db.execute("BEGIN IMMEDIATE")
+                row = self.db.execute(
+                    "SELECT status, updated_at > datetime('now', '-10 minutes') FROM deliveries "
+                    "WHERE session_id=? AND recipient_id=? AND message_type=?",
+                    (session_id, recipient_id, message_type),
+                ).fetchone()
+                if row and (row[0] == "sent" or (row[0] == "sending" and row[1])):
+                    self.db.commit()
+                    return False
+                self.db.execute(
+                    "INSERT INTO deliveries VALUES(?,?,?,?,?,?,datetime('now')) "
+                    "ON CONFLICT(session_id,recipient_id,message_type) DO UPDATE SET "
+                    "status='sending', message_id='', error=NULL, updated_at=datetime('now')",
+                    (session_id, recipient_id, message_type, "sending", "", ""),
+                )
+                self.db.commit()
+                return True
+            except Exception:
+                self.db.rollback()
+                raise
 
     def finish(self, session_id: str, recipient_id: str, message_type: str, message_id: str = "", error: str = "") -> None:
         status = "sent" if not error else "failed"
@@ -125,25 +160,40 @@ class DeliveryLedger:
         with self.lock, self.db:
             self.db.execute("UPDATE sessions SET active=0 WHERE account_id=?", (account_id,))
 
-    def session_artifacts(self, session_id: str) -> dict[str, str] | None:
+    def session_artifacts(self, session_id: str) -> dict[str, Any] | None:
         with self.lock:
-            row = self.db.execute("SELECT video_url, transcript_url, minute_url, video_name, transcript_name FROM session_artifacts WHERE session_id=?", (session_id,)).fetchone()
+            row = self.db.execute(
+                "SELECT archive_video_url, minutes_url, transcript_url, summary_url, video_name, "
+                "minutes_title, minutes_created_at FROM session_artifacts WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
         if not row:
             return None
-        return dict(zip(("video_url", "transcript_url", "minute_url", "video_name", "transcript_name"), row))
+        return dict(zip((
+            "archive_video_url", "minutes_url", "transcript_url", "summary_url", "video_name",
+            "minutes_title", "minutes_created_at",
+        ), row))
 
-    def save_session_artifacts(self, session_id: str, *, video_url: str, transcript_url: str,
-                               minute_url: str, video_name: str, transcript_name: str) -> None:
+    def save_session_artifacts(self, session_id: str, **artifacts: str | int) -> None:
+        allowed = {
+            "archive_video_url", "minutes_url", "transcript_url", "summary_url", "video_name",
+            "minutes_title", "minutes_created_at",
+        }
+        unknown = set(artifacts) - allowed
+        if unknown:
+            raise TypeError(f"Unknown session artifact fields: {', '.join(sorted(unknown))}")
         with self.lock, self.db:
-            self.db.execute(
-                "INSERT INTO session_artifacts VALUES(?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET video_url=excluded.video_url, transcript_url=excluded.transcript_url, minute_url=excluded.minute_url, video_name=excluded.video_name, transcript_name=excluded.transcript_name",
-                (session_id, video_url, transcript_url, minute_url, video_name, transcript_name),
-            )
+            self.db.execute("INSERT OR IGNORE INTO session_artifacts(session_id) VALUES(?)", (session_id,))
+            if artifacts:
+                assignments = ", ".join(f"{name}=?" for name in artifacts)
+                self.db.execute(
+                    f"UPDATE session_artifacts SET {assignments} WHERE session_id=?",
+                    (*artifacts.values(), session_id),
+                )
 
-    def save_uploaded_video(self, session_id: str, *, video_url: str, video_name: str) -> None:
+    def save_uploaded_video(self, session_id: str, *, archive_video_url: str, video_name: str) -> None:
         self.save_session_artifacts(
-            session_id, video_url=video_url, transcript_url="", minute_url="",
-            video_name=video_name, transcript_name="",
+            session_id, archive_video_url=archive_video_url, video_name=video_name,
         )
 
 
@@ -400,15 +450,15 @@ def upload_bitable_attachment(settings: Settings, path: Path) -> str | None:
     return feishu_response_data(response).get("data", {}).get("file_token")
 
 
-def attach_session_artifacts(settings: Settings, record_id: str, screenshot: Path, *, minute_url: str = "",
-                             transcript_url: str = "") -> None:
+def attach_session_artifacts(settings: Settings, record_id: str, screenshot: Path, *, transcript_url: str = "",
+                             summary_url: str = "") -> None:
     """Attach the screenshot and write the durable Feishu links for a session."""
     fields: dict[str, Any] = {}
     image_token = upload_bitable_attachment(settings, screenshot)
     if image_token:
         fields["截图"] = [{"file_token": image_token, "name": screenshot.name}]
-    if minute_url:
-        fields["智能纪要链接"] = {"link": minute_url, "text": "打开智能纪要"}
+    if summary_url:
+        fields["智能纪要链接"] = {"link": summary_url, "text": "打开智能纪要"}
     if transcript_url:
         fields["文字记录链接"] = {"link": transcript_url, "text": "打开文字记录"}
     if fields:
@@ -478,7 +528,9 @@ def drive_list(settings: Settings, folder_token: str) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     page_token = ""
     while True:
-        params: dict[str, Any] = {"folder_token": folder_token, "page_size": 200}
+        params: dict[str, Any] = {"page_size": 200}
+        if folder_token:
+            params["folder_token"] = folder_token
         if page_token:
             params["page_token"] = page_token
         data = user_feishu_request(settings, "GET", "/drive/v1/files", params=params).get("data", {})
@@ -615,36 +667,58 @@ def upload_minutes(settings: Settings, file_token: str) -> tuple[str, str]:
     return str(token), str(url)
 
 
-def wait_for_transcript(settings: Settings, minute_token: str) -> str:
+def minutes_detail(settings: Settings, minute_token: str) -> dict[str, Any]:
+    data = user_feishu_request(settings, "GET", f"/minutes/v1/minutes/{minute_token}").get("data", {})
+    minute = data.get("minute", {})
+    if not minute.get("title") or not minute.get("create_time"):
+        raise RuntimeError("Feishu Minutes did not return title and creation time")
+    return minute
+
+
+def find_minutes_documents(files: list[dict[str, Any]], *, title: str,
+                           created_at_ms: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Match only the two DOCX files automatically generated for this Minutes item."""
+    created_at_seconds = created_at_ms // 1000
+
+    def newest(prefix: str) -> dict[str, Any] | None:
+        matches = []
+        for item in files:
+            try:
+                created_time = int(item.get("created_time", 0))
+            except (TypeError, ValueError):
+                continue
+            if (
+                item.get("type") == "docx"
+                and str(item.get("name", "")).startswith(f"{prefix}{title}")
+                and created_time >= created_at_seconds
+                and item.get("url")
+            ):
+                matches.append(item)
+        return max(matches, key=lambda item: int(item.get("created_time", 0)), default=None)
+
+    return newest("文字记录："), newest("智能纪要：")
+
+
+def wait_for_minutes_documents(settings: Settings, minute_token: str) -> dict[str, Any]:
+    """Wait until Feishu has produced both its transcript and smart-summary documents."""
     deadline = time.monotonic() + settings.minutes_timeout_seconds
+    minute: dict[str, Any] | None = None
     while time.monotonic() < deadline:
-        response = requests.get(
-            f"https://open.feishu.cn/open-apis/minutes/v1/minutes/{minute_token}/transcript",
-            headers={"Authorization": f"Bearer {user_token(settings)}"}, timeout=60,
+        if minute is None:
+            minute = minutes_detail(settings, minute_token)
+        transcript, summary = find_minutes_documents(
+            drive_list(settings, ""), title=str(minute["title"]), created_at_ms=int(minute["create_time"]),
         )
-        if response.status_code == 200:
-            return response.text.strip()
-        try:
-            data = response.json()
-        except ValueError:
-            response.raise_for_status()
-            raise RuntimeError("Feishu Minutes returned an unreadable transcript response")
-        if data.get("code") != 2091003:
-            feishu_response_data(response)
+        if transcript and summary:
+            return {
+                "minutes_url": str(minute.get("url", "")),
+                "minutes_title": str(minute["title"]),
+                "minutes_created_at": int(minute["create_time"]),
+                "transcript_url": str(transcript["url"]),
+                "summary_url": str(summary["url"]),
+            }
         time.sleep(settings.minutes_poll_seconds)
-    raise RuntimeError("Feishu Minutes transcription timed out")
-
-
-def create_transcript_docx(path: Path, account_name: str, session_id: str, transcript: str) -> Path:
-    from docx import Document
-
-    document = Document()
-    document.add_heading(f"{account_name} 直播逐字稿", level=1)
-    document.add_paragraph(f"直播开始时间：{artifact_timestamp(session_id)}")
-    for paragraph in transcript.splitlines():
-        document.add_paragraph(paragraph)
-    document.save(path)
-    return path
+    raise RuntimeError("Feishu Minutes document generation timed out")
 
 
 def upload_file(settings: Settings, path: Path) -> str | None:
@@ -767,8 +841,8 @@ def capture_screenshot(video: Path, screenshot: Path) -> None:
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def recording_complete_message(account_name: str, session_id: str, video_url: str, transcript_url: str,
-                               minute_url: str) -> str:
+def recording_complete_message(account_name: str, session_id: str, minutes_url: str, transcript_url: str,
+                               summary_url: str) -> str:
     """Build the single post-processing notification required for a live session."""
     try:
         started = datetime.strptime(session_id, "%Y%m%d_%H%M%S")
@@ -778,42 +852,41 @@ def recording_complete_message(account_name: str, session_id: str, video_url: st
     return (
         "【直播录制完成提醒】\n"
         f"“{account_name}”在“{started_label}”的直播录制已完成，请查收。\n"
-        f"录制视频：\n{video_url}\n"
-        f"文字记录：\n{transcript_url}\n"
-        f"智能纪要：\n{minute_url}"
+        f"1.录制视频：\n{minutes_url}\n"
+        f"2.文字记录：\n{transcript_url}\n"
+        f"3.智能纪要：\n{summary_url}"
     )
 
 
-def recording_complete_post(account_name: str, session_id: str, video_url: str, transcript_url: str,
-                            minute_url: str, video_name: str, transcript_name: str) -> dict[str, Any]:
-    """Build a completion message with stable, account-name based link labels."""
+def recording_complete_post(account_name: str, session_id: str, minutes_url: str, transcript_url: str,
+                            summary_url: str) -> dict[str, Any]:
+    """Build the numbered completion message with the three Feishu-generated assets."""
     try:
         started = datetime.strptime(session_id, "%Y%m%d_%H%M%S")
         started_label = f"{started.year}年{started.month}月{started.day}日 {started.hour}点{started.minute}"
     except ValueError:
         started_label = session_id
-    minute_name = f"智能纪要-{account_name}-{artifact_timestamp(session_id)}"
     return {"zh_cn": {"title": "", "content": [
         [{"tag": "text", "text": "【直播录制完成提醒】"}],
         [{"tag": "text", "text": f"“{account_name}”在“{started_label}”的直播录制已完成，请查收。"}],
-        [{"tag": "text", "text": "录制视频："}],
-        [{"tag": "a", "text": video_name, "href": video_url}],
-        [{"tag": "text", "text": "文字记录："}],
-        [{"tag": "a", "text": transcript_name, "href": transcript_url}],
-        [{"tag": "text", "text": "智能纪要："}],
-        [{"tag": "a", "text": minute_name, "href": minute_url}],
+        [{"tag": "text", "text": "1.录制视频："}],
+        [{"tag": "a", "text": minutes_url, "href": minutes_url}],
+        [{"tag": "text", "text": "2.文字记录："}],
+        [{"tag": "a", "text": transcript_url, "href": transcript_url}],
+        [{"tag": "text", "text": "3.智能纪要："}],
+        [{"tag": "a", "text": summary_url, "href": summary_url}],
     ]}}
 
 
 def publish_finished_session(
-    settings: Settings, *, account_name: str, session_id: str, video_url: str, transcript_url: str,
-    minute_url: str, video_name: str, transcript_name: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
+    settings: Settings, *, account_name: str, session_id: str, minutes_url: str, transcript_url: str,
+    summary_url: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
 ) -> None:
     """Send one completion message, with all finished-session assets as links."""
     send_post(
         settings,
-        recording_complete_post(account_name, session_id, video_url, transcript_url, minute_url, video_name, transcript_name),
-        recording_complete_message(account_name, session_id, video_url, transcript_url, minute_url),
+        recording_complete_post(account_name, session_id, minutes_url, transcript_url, summary_url),
+        recording_complete_message(account_name, session_id, minutes_url, transcript_url, summary_url),
         recipients=recipients,
         session_id=session_id,
         message_type="recording_complete",
@@ -829,16 +902,16 @@ def complete_with_feishu_minutes(
     screenshot = artifact_path(room_dir, "直播截图", account_name, session_id, ".jpg")
     complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
     artifacts = ledger.session_artifacts(session_id) or {}
-    video_url = artifacts.get("video_url", "")
+    archive_video_url = artifacts.get("archive_video_url", "")
     video_name = artifacts.get("video_name", "")
-    if not video_url:
+    if not archive_video_url:
         with _VIDEO_ARCHIVE_LOCK:
             # Another recovery worker may have completed the upload while this
             # task waited for the bounded disk-intensive archive section.
             artifacts = ledger.session_artifacts(session_id) or {}
-            video_url = artifacts.get("video_url", "")
+            archive_video_url = artifacts.get("archive_video_url", "")
             video_name = artifacts.get("video_name", "")
-            if not video_url:
+            if not archive_video_url:
                 if not video_is_readable(complete_video):
                     ensure_merge_space(segments, room_dir)
                     concat_segments(segments, complete_video)
@@ -847,46 +920,42 @@ def complete_with_feishu_minutes(
                 update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
                 archive_folder = session_drive_folder(settings, account_name)
                 video_token = upload_drive_file(settings, complete_video, archive_folder)
-                video_url = drive_file_url(video_token)
+                archive_video_url = drive_file_url(video_token)
                 video_name = complete_video.name
-                ledger.save_uploaded_video(session_id, video_url=video_url, video_name=video_name)
+                ledger.save_uploaded_video(
+                    session_id, archive_video_url=archive_video_url, video_name=video_name,
+                )
     cleanup_uploaded_recordings(segments, complete_video)
 
     artifacts = ledger.session_artifacts(session_id) or artifacts
     transcript_url = artifacts.get("transcript_url", "")
-    minute_url = artifacts.get("minute_url", "")
-    transcript_name = artifacts.get("transcript_name", "")
-    if not transcript_url:
-        archive_folder = session_drive_folder(settings, account_name)
-        if minute_url:
-            minute_token = minute_url.rstrip("/").rsplit("/", 1)[-1]
+    summary_url = artifacts.get("summary_url", "")
+    minutes_url = artifacts.get("minutes_url", "")
+    if not transcript_url or not summary_url:
+        if minutes_url:
+            minute_token = minutes_url.rstrip("/").rsplit("/", 1)[-1]
         else:
-            video_token = video_url.rstrip("/").rsplit("/", 1)[-1]
-            minute_token, minute_url = upload_minutes(settings, video_token)
+            video_token = archive_video_url.rstrip("/").rsplit("/", 1)[-1]
+            minute_token, minutes_url = upload_minutes(settings, video_token)
             ledger.save_session_artifacts(
-                session_id, video_url=video_url, transcript_url="", minute_url=minute_url,
-                video_name=video_name, transcript_name="",
+                session_id, minutes_url=minutes_url,
             )
-        transcript_text = wait_for_transcript(settings, minute_token)
-        transcript_docx = artifact_path(room_dir, "直播逐字稿", account_name, session_id, ".docx")
-        create_transcript_docx(transcript_docx, account_name, session_id, transcript_text)
-        transcript_token = upload_drive_file(settings, transcript_docx, archive_folder)
-        transcript_url = drive_file_url(transcript_token)
-        transcript_name = transcript_docx.name
-        ledger.save_session_artifacts(
-            session_id, video_url=video_url, transcript_url=transcript_url, minute_url=minute_url,
-            video_name=video_name, transcript_name=transcript_name,
-        )
-    attach_session_artifacts(settings, record_id, screenshot, minute_url=minute_url, transcript_url=transcript_url)
+        minutes_artifacts = wait_for_minutes_documents(settings, minute_token)
+        minutes_url = str(minutes_artifacts["minutes_url"] or minutes_url)
+        transcript_url = str(minutes_artifacts["transcript_url"])
+        summary_url = str(minutes_artifacts["summary_url"])
+        ledger.save_session_artifacts(session_id, **minutes_artifacts)
+    attach_session_artifacts(
+        settings, record_id, screenshot, transcript_url=transcript_url, summary_url=summary_url,
+    )
     update_live_record(settings, record_id, {
         "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送中",
         "失败原因": "",
     })
     try:
         publish_finished_session(
-            settings, account_name=account_name, session_id=session_id, video_url=video_url,
-            transcript_url=transcript_url, minute_url=minute_url, video_name=video_name,
-            transcript_name=transcript_name,
+            settings, account_name=account_name, session_id=session_id, minutes_url=minutes_url,
+            transcript_url=transcript_url, summary_url=summary_url,
             recipients=recipients, ledger=ledger,
         )
     except Exception as exc:
@@ -1084,8 +1153,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 if first_segment:
                     publish_finished_session(
                         settings, account_name=snap_name, session_id=session_stamp or "unknown",
-                        video_url=str(first_segment), transcript_url=str(full_path), minute_url="",
-                        video_name=first_segment.name, transcript_name=full_path.name,
+                        minutes_url=str(first_segment), transcript_url=str(full_path), summary_url="",
                         recipients=snap_recipients, ledger=ledger,
                     )
                     attach_session_artifacts(
