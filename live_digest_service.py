@@ -83,6 +83,7 @@ class DeliveryLedger:
             self.db.execute("CREATE TABLE IF NOT EXISTS deliveries (session_id TEXT, recipient_id TEXT, message_type TEXT, status TEXT, message_id TEXT, error TEXT, updated_at TEXT, PRIMARY KEY(session_id, recipient_id, message_type))")
             self.db.execute("CREATE TABLE IF NOT EXISTS sessions (account_id TEXT PRIMARY KEY, session_id TEXT, account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER)")
             self.db.execute("CREATE TABLE IF NOT EXISTS session_artifacts (session_id TEXT PRIMARY KEY, archive_video_url TEXT, minutes_url TEXT, transcript_url TEXT, summary_url TEXT, video_name TEXT, minutes_title TEXT, minutes_created_at INTEGER)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS minutes_submissions (session_id TEXT PRIMARY KEY, status TEXT, minutes_url TEXT, error TEXT, updated_at TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(session_artifacts)")}
             for name, definition in {
@@ -101,6 +102,11 @@ class DeliveryLedger:
                     "UPDATE session_artifacts SET minutes_url=minute_url "
                     "WHERE COALESCE(minutes_url, '')=''"
                 )
+            self.db.execute(
+                "INSERT OR IGNORE INTO minutes_submissions(session_id,status,minutes_url,error,updated_at) "
+                "SELECT session_id,'completed',minutes_url,'',datetime('now') FROM session_artifacts "
+                "WHERE COALESCE(minutes_url, '')<>''"
+            )
 
     def claim(self, session_id: str, recipient_id: str, message_type: str) -> bool:
         with self.lock:
@@ -132,6 +138,38 @@ class DeliveryLedger:
         status = "sent" if not error else "failed"
         with self.lock, self.db:
             self.db.execute("UPDATE deliveries SET status=?, message_id=?, error=?, updated_at=datetime('now') WHERE session_id=? AND recipient_id=? AND message_type=?", (status, message_id, error, session_id, recipient_id, message_type))
+
+    def claim_minutes_submission(self, session_id: str) -> tuple[bool, str]:
+        """Claim the one allowed Minutes creation call for a session."""
+        with self.lock:
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+                row = self.db.execute(
+                    "SELECT status, minutes_url FROM minutes_submissions WHERE session_id=?", (session_id,),
+                ).fetchone()
+                if row and row[0] in {"submitting", "completed"}:
+                    self.db.commit()
+                    return False, str(row[1] or "")
+                self.db.execute(
+                    "INSERT INTO minutes_submissions VALUES(?, 'submitting', '', '', datetime('now')) "
+                    "ON CONFLICT(session_id) DO UPDATE SET status='submitting', minutes_url='', "
+                    "error='', updated_at=datetime('now')",
+                    (session_id,),
+                )
+                self.db.commit()
+                return True, ""
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def finish_minutes_submission(self, session_id: str, *, minutes_url: str = "", error: str = "") -> None:
+        status = "completed" if minutes_url else "failed"
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE minutes_submissions SET status=?, minutes_url=?, error=?, updated_at=datetime('now') "
+                "WHERE session_id=?",
+                (status, minutes_url, error, session_id),
+            )
 
     def active_session(self, account_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -935,8 +973,24 @@ def complete_with_feishu_minutes(
         if minutes_url:
             minute_token = minutes_url.rstrip("/").rsplit("/", 1)[-1]
         else:
-            video_token = archive_video_url.rstrip("/").rsplit("/", 1)[-1]
-            minute_token, minutes_url = upload_minutes(settings, video_token)
+            claimed, submitted_url = ledger.claim_minutes_submission(session_id)
+            if submitted_url:
+                minutes_url = submitted_url
+                minute_token = minutes_url.rstrip("/").rsplit("/", 1)[-1]
+            elif not claimed:
+                raise RuntimeError(
+                    "该场次的飞书妙记创建请求已在执行中；为防止重复创建，本次任务不会再次提交"
+                )
+            else:
+                video_token = archive_video_url.rstrip("/").rsplit("/", 1)[-1]
+                try:
+                    minute_token, minutes_url = upload_minutes(settings, video_token)
+                except Exception as exc:
+                    ledger.finish_minutes_submission(session_id, error=str(exc))
+                    raise
+                # Persist the returned URL in the submission ledger first. If
+                # later processing crashes, a recovery worker reuses this URL.
+                ledger.finish_minutes_submission(session_id, minutes_url=minutes_url)
             ledger.save_session_artifacts(
                 session_id, minutes_url=minutes_url,
             )

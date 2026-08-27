@@ -55,6 +55,19 @@ class DeliveryLedgerTest(unittest.TestCase):
             self.assertTrue(first.claim("session", "recipient", "recording_complete"))
             self.assertFalse(second.claim("session", "recipient", "recording_complete"))
 
+    def test_minutes_creation_is_claimed_once_and_completed_url_is_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            first = DeliveryLedger(path)
+            second = DeliveryLedger(path)
+            self.assertEqual(first.claim_minutes_submission("session"), (True, ""))
+            self.assertEqual(second.claim_minutes_submission("session"), (False, ""))
+            first.finish_minutes_submission("session", minutes_url="https://tenant/minutes/token")
+            self.assertEqual(
+                second.claim_minutes_submission("session"),
+                (False, "https://tenant/minutes/token"),
+            )
+
 
 class FeishuConfigTest(unittest.TestCase):
     def test_account_table_is_the_runtime_configuration_source(self):
