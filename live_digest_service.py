@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -61,6 +62,13 @@ class Account:
 
 class CompletionNotificationError(RuntimeError):
     """The recording was processed, but one or more completion messages failed."""
+
+
+class LowDiskSpaceError(RuntimeError):
+    """There is not enough free space to create the merged recording."""
+
+
+_VIDEO_ARCHIVE_LOCK = threading.Lock()
 
 
 class DeliveryLedger:
@@ -129,6 +137,12 @@ class DeliveryLedger:
                 "INSERT INTO session_artifacts VALUES(?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET video_url=excluded.video_url, transcript_url=excluded.transcript_url, minute_url=excluded.minute_url, video_name=excluded.video_name, transcript_name=excluded.transcript_name",
                 (session_id, video_url, transcript_url, minute_url, video_name, transcript_name),
             )
+
+    def save_uploaded_video(self, session_id: str, *, video_url: str, video_name: str) -> None:
+        self.save_session_artifacts(
+            session_id, video_url=video_url, transcript_url="", minute_url="",
+            video_name=video_name, transcript_name="",
+        )
 
 
 _USER_TOKEN_LOCK = threading.Lock()
@@ -436,6 +450,15 @@ def cleanup_uploaded_recordings(segments: list[Path], complete_video: Path) -> N
             print(f"Uploaded recording cleanup failed for {path}: {exc}", flush=True)
 
 
+def ensure_merge_space(segments: list[Path], output_dir: Path, reserve_bytes: int = 512 * 1024 * 1024) -> None:
+    required = sum(path.stat().st_size for path in segments) + reserve_bytes
+    available = shutil.disk_usage(output_dir).free
+    if available < required:
+        raise LowDiskSpaceError(
+            f"合并录像所需空间不足：需要约 {required / 1024**3:.1f} GB，当前可用 {available / 1024**3:.1f} GB；等待其他已上传场次清理后重试"
+        )
+
+
 def drive_list(settings: Settings, folder_token: str) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     page_token = ""
@@ -730,35 +753,45 @@ def complete_with_feishu_minutes(
     """Create one complete video, archive it, transcribe it in Minutes, then publish once."""
     screenshot = artifact_path(room_dir, "直播截图", account_name, session_id, ".jpg")
     complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
-    completed = ledger.session_artifacts(session_id)
-    if completed:
-        video_url = completed["video_url"]
-        transcript_url = completed["transcript_url"]
-        minute_url = completed["minute_url"]
-        video_name = completed["video_name"]
-        transcript_name = completed["transcript_name"]
-    else:
-        concat_segments(segments, complete_video)
-        capture_screenshot(complete_video, screenshot)
-        update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
+    artifacts = ledger.session_artifacts(session_id) or {}
+    video_url = artifacts.get("video_url", "")
+    video_name = artifacts.get("video_name", "")
+    if not video_url:
+        with _VIDEO_ARCHIVE_LOCK:
+            # Another recovery worker may have completed the upload while this
+            # task waited for the bounded disk-intensive archive section.
+            artifacts = ledger.session_artifacts(session_id) or {}
+            video_url = artifacts.get("video_url", "")
+            video_name = artifacts.get("video_name", "")
+            if not video_url:
+                ensure_merge_space(segments, room_dir)
+                concat_segments(segments, complete_video)
+                capture_screenshot(complete_video, screenshot)
+                update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
+                archive_folder = session_drive_folder(settings, account_name)
+                video_token = upload_drive_file(settings, complete_video, archive_folder)
+                video_url = drive_file_url(video_token)
+                video_name = complete_video.name
+                ledger.save_uploaded_video(session_id, video_url=video_url, video_name=video_name)
+    cleanup_uploaded_recordings(segments, complete_video)
 
+    transcript_url = artifacts.get("transcript_url", "")
+    minute_url = artifacts.get("minute_url", "")
+    transcript_name = artifacts.get("transcript_name", "")
+    if not (transcript_url and minute_url):
         archive_folder = session_drive_folder(settings, account_name)
-        video_token = upload_drive_file(settings, complete_video, archive_folder)
-        video_url = drive_file_url(video_token)
+        video_token = video_url.rstrip("/").rsplit("/", 1)[-1]
         minute_token, minute_url = upload_minutes(settings, video_token)
         transcript_text = wait_for_transcript(settings, minute_token)
         transcript_docx = artifact_path(room_dir, "直播逐字稿", account_name, session_id, ".docx")
         create_transcript_docx(transcript_docx, account_name, session_id, transcript_text)
         transcript_token = upload_drive_file(settings, transcript_docx, archive_folder)
         transcript_url = drive_file_url(transcript_token)
-        video_name = complete_video.name
         transcript_name = transcript_docx.name
         ledger.save_session_artifacts(
             session_id, video_url=video_url, transcript_url=transcript_url, minute_url=minute_url,
             video_name=video_name, transcript_name=transcript_name,
         )
-    cleanup_uploaded_recordings(segments, complete_video)
-
     attach_session_artifacts(settings, record_id, screenshot, minute_url=minute_url, transcript_url=transcript_url)
     update_live_record(settings, record_id, {
         "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送中",
@@ -939,6 +972,11 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                                 title=info.get("title", ""), url=url, recipients=snap_recipients, ledger=ledger,
                             )
                         except CompletionNotificationError:
+                            raise
+                        except LowDiskSpaceError as exc:
+                            update_live_record(settings, record_id, {
+                                "转写状态": "待转写", "完成提醒状态": "待发送", "失败原因": str(exc)[:1000],
+                            })
                             raise
                         except Exception as exc:
                             update_live_record(settings, record_id, {
