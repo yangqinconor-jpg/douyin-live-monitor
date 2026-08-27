@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,12 +8,38 @@ from live_digest_service import (
     Account, CompletionNotificationError, DeliveryLedger, LowDiskSpaceError, Settings, artifact_path,
     attach_session_artifacts, cleanup_uploaded_recordings, complete_with_feishu_minutes, concat_segments,
     create_live_record, drive_file_url, ensure_merge_space, find_minutes_documents, message_url,
-    recording_complete_message, recording_complete_post, send_post, session_segments, sync_accounts,
-    upload_drive_file, video_is_readable,
+    RecordingIntegrityError, VideoMetadata, recording_complete_message, recording_complete_post,
+    recording_integrity_result, send_post, session_segments, sync_accounts, upload_drive_file,
+    stable_file_sizes, verify_drive_file_size, video_is_readable,
 )
 
 
 class DeliveryLedgerTest(unittest.TestCase):
+    def test_old_artifact_database_is_migrated_without_losing_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE session_artifacts ("
+                "session_id TEXT PRIMARY KEY, archive_video_url TEXT, minutes_url TEXT, "
+                "transcript_url TEXT, summary_url TEXT, video_name TEXT, minutes_title TEXT, "
+                "minutes_created_at INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO session_artifacts VALUES(?,?,?,?,?,?,?,?)",
+                ("session", "https://archive", "https://minutes", "https://transcript",
+                 "https://summary", "video.mp4", "video", 123),
+            )
+            connection.commit()
+            connection.close()
+
+            ledger = DeliveryLedger(path)
+            artifacts = ledger.session_artifacts("session")
+            self.assertEqual(artifacts["archive_video_url"], "https://archive")
+            self.assertEqual(artifacts["minutes_url"], "https://minutes")
+            self.assertIsNone(artifacts["archive_video_size"])
+            self.assertIsNone(artifacts["recording_status"])
+
     def test_sent_delivery_is_not_claimed_again_and_failed_delivery_is(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = DeliveryLedger(Path(directory) / "state.sqlite3")
@@ -45,6 +72,7 @@ class DeliveryLedgerTest(unittest.TestCase):
                 "archive_video_url": "https://archive", "minutes_url": "https://minutes",
                 "transcript_url": "https://transcript", "summary_url": "https://summary",
                 "video_name": "video.mp4", "minutes_title": "video", "minutes_created_at": 123,
+                "archive_video_size": None, "recording_status": None, "integrity_note": None,
             })
 
     def test_in_flight_delivery_cannot_be_claimed_by_a_second_worker(self):
@@ -126,12 +154,45 @@ class FeishuConfigTest(unittest.TestCase):
             complete = folder / "session_00.mp4"
             current_recording = folder / "current_000.mp4"
             for path in (first, second, complete, current_recording):
-                path.touch()
-            cleanup_uploaded_recordings([first, second], complete)
+                path.write_bytes(b"data")
+            cleanup_uploaded_recordings([first, second], complete, 4)
             self.assertFalse(first.exists())
             self.assertFalse(second.exists())
             self.assertFalse(complete.exists())
             self.assertTrue(current_recording.exists())
+
+    def test_cleanup_preserves_files_when_verified_size_differs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            segment = folder / "segment.mp4"
+            complete = folder / "complete.mp4"
+            segment.write_bytes(b"segment")
+            complete.write_bytes(b"video")
+            with self.assertRaisesRegex(RecordingIntegrityError, "删除前校验失败"):
+                cleanup_uploaded_recordings([segment], complete, 999)
+            self.assertTrue(segment.exists())
+            self.assertTrue(complete.exists())
+
+    def test_short_or_damaged_recording_is_marked_partial(self):
+        status, note = recording_integrity_result(
+            [VideoMetadata(100, 7200)], [Path("broken_008.mp4")], 12_480,
+        )
+        self.assertEqual(status, "部分录制")
+        self.assertIn("broken_008.mp4", note)
+        self.assertIn("缺失约 88.0 分钟", note)
+
+    def test_changing_file_is_rejected_before_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "recording.mp4"
+            video.write_bytes(b"before")
+            with patch("live_digest_service.time.sleep", side_effect=lambda _seconds: video.write_bytes(b"after-data")):
+                with self.assertRaisesRegex(RecordingIntegrityError, "仍在写入"):
+                    stable_file_sizes([video])
+
+    @patch("live_digest_service.drive_download_size", return_value=99)
+    def test_remote_size_must_equal_local_size(self, _size):
+        with self.assertRaisesRegex(RecordingIntegrityError, "本地 100 字节，云端 99 字节"):
+            verify_drive_file_size(Settings(Path("."), Path("."), ""), "token", 100)
 
     @patch("live_digest_service.shutil.disk_usage")
     def test_merge_waits_when_disk_cannot_hold_a_complete_copy(self, disk_usage):
@@ -155,7 +216,8 @@ class FeishuConfigTest(unittest.TestCase):
     @patch("live_digest_service.user_feishu_request")
     @patch("live_digest_service.user_token", return_value="token")
     @patch("live_digest_service.requests.post")
-    def test_drive_upload_retries_a_transient_part_failure(self, post, _token, request):
+    @patch("live_digest_service.verify_drive_file_size")
+    def test_drive_upload_retries_a_transient_part_failure(self, verify_size, post, _token, request):
         request.side_effect = [
             {"data": {"upload_id": "upload", "block_size": 4, "block_num": 1}},
             {"data": {"file_token": "file-token"}},
@@ -175,11 +237,62 @@ class FeishuConfigTest(unittest.TestCase):
             "upload_id": "upload", "seq": "0", "size": "4", "checksum": "67109275",
         })
         self.assertNotIn("params", kwargs)
+        verify_size.assert_called_once_with(unittest.mock.ANY, "file-token", 4)
 
     @patch("live_digest_service.user_feishu_request")
     @patch("live_digest_service.user_token", return_value="token")
     @patch("live_digest_service.requests.post")
-    def test_drive_upload_resumes_only_missing_parts(self, post, _token, request):
+    def test_drive_upload_stops_when_local_file_changes(self, post, _token, request):
+        request.return_value = {"data": {"upload_id": "upload", "block_size": 4, "block_num": 1}}
+        success = unittest.mock.Mock()
+        success.raise_for_status.return_value = None
+        success.json.return_value = {"code": 0, "data": {}}
+        with tempfile.TemporaryDirectory() as directory, patch("live_digest_service.time.sleep"):
+            video = Path(directory) / "video.mp4"
+            video.write_bytes(b"data")
+
+            def mutate_after_part(*_args, **_kwargs):
+                video.write_bytes(b"changed")
+                return success
+
+            post.side_effect = mutate_after_part
+            with self.assertRaisesRegex(RecordingIntegrityError, "上传期间发生变化"):
+                upload_drive_file(Settings(Path("."), Path("."), ""), video, "folder")
+        self.assertEqual(request.call_count, 1)
+
+    @patch("live_digest_service.verify_drive_file_size")
+    @patch("live_digest_service.user_feishu_request")
+    @patch("live_digest_service.user_token", return_value="token")
+    @patch("live_digest_service.requests.post")
+    def test_drive_upload_retry_reuses_token_after_verification_failure(
+        self, post, _token, request, verify_size,
+    ):
+        request.side_effect = [
+            {"data": {"upload_id": "upload", "block_size": 4, "block_num": 1}},
+            {"data": {"file_token": "file-token"}},
+        ]
+        verify_size.side_effect = [RecordingIntegrityError("云端大小查询失败"), None]
+        success = unittest.mock.Mock()
+        success.raise_for_status.return_value = None
+        success.json.return_value = {"code": 0, "data": {}}
+        post.return_value = success
+        with tempfile.TemporaryDirectory() as directory, patch("live_digest_service.time.sleep"):
+            video = Path(directory) / "video.mp4"
+            video.write_bytes(b"data")
+            with self.assertRaisesRegex(RecordingIntegrityError, "云端大小查询失败"):
+                upload_drive_file(Settings(Path("."), Path("."), ""), video, "folder")
+            self.assertEqual(
+                upload_drive_file(Settings(Path("."), Path("."), ""), video, "folder"), "file-token",
+            )
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(verify_size.call_count, 2)
+
+    @patch("live_digest_service.user_feishu_request")
+    @patch("live_digest_service.user_token", return_value="token")
+    @patch("live_digest_service.requests.post")
+    @patch("live_digest_service.verify_drive_file_size")
+    def test_drive_upload_resumes_only_missing_parts(self, _verify, post, _token, request):
         request.side_effect = [
             {"data": {"upload_id": "upload", "block_size": 4, "block_num": 2}},
             {"data": {"file_token": "file-token"}},
@@ -356,7 +469,13 @@ class FeishuConfigTest(unittest.TestCase):
     @patch("live_digest_service.drive_file_url", return_value="https://archive")
     @patch("live_digest_service.session_drive_folder", return_value="folder")
     @patch("live_digest_service.concat_segments")
-    def test_notification_retry_reuses_finished_artifacts(self, _concat, _folder, _url, uploads,
+    @patch("live_digest_service.ensure_merge_space")
+    @patch("live_digest_service.verify_drive_file_size")
+    @patch("live_digest_service.verify_merged_video", return_value=VideoMetadata(123, 60))
+    @patch("live_digest_service.inspect_recording_segments", return_value=(
+        [Path("segment.mp4")], [VideoMetadata(123, 60)], [],
+    ))
+    def test_notification_retry_reuses_finished_artifacts(self, _inspect, _merged, _verify, _space, _concat, _folder, _url, uploads,
                                                           _minutes, _documents, _publish, _readable, cleanup,
                                                           _attach, _update):
         with tempfile.TemporaryDirectory() as directory:

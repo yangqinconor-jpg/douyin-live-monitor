@@ -70,6 +70,16 @@ class LowDiskSpaceError(RuntimeError):
     """There is not enough free space to create the merged recording."""
 
 
+class RecordingIntegrityError(RuntimeError):
+    """A local or uploaded recording failed an integrity check."""
+
+
+@dataclass(frozen=True)
+class VideoMetadata:
+    size_bytes: int
+    duration_seconds: float
+
+
 _VIDEO_ARCHIVE_LOCK = threading.Lock()
 
 
@@ -82,13 +92,14 @@ class DeliveryLedger:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS deliveries (session_id TEXT, recipient_id TEXT, message_type TEXT, status TEXT, message_id TEXT, error TEXT, updated_at TEXT, PRIMARY KEY(session_id, recipient_id, message_type))")
             self.db.execute("CREATE TABLE IF NOT EXISTS sessions (account_id TEXT PRIMARY KEY, session_id TEXT, account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER)")
-            self.db.execute("CREATE TABLE IF NOT EXISTS session_artifacts (session_id TEXT PRIMARY KEY, archive_video_url TEXT, minutes_url TEXT, transcript_url TEXT, summary_url TEXT, video_name TEXT, minutes_title TEXT, minutes_created_at INTEGER)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS session_artifacts (session_id TEXT PRIMARY KEY, archive_video_url TEXT, archive_video_size INTEGER, minutes_url TEXT, transcript_url TEXT, summary_url TEXT, video_name TEXT, minutes_title TEXT, minutes_created_at INTEGER, recording_status TEXT, integrity_note TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS minutes_submissions (session_id TEXT PRIMARY KEY, status TEXT, minutes_url TEXT, error TEXT, updated_at TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(session_artifacts)")}
             for name, definition in {
-                "archive_video_url": "TEXT", "minutes_url": "TEXT", "summary_url": "TEXT",
-                "minutes_title": "TEXT", "minutes_created_at": "INTEGER",
+                "archive_video_url": "TEXT", "archive_video_size": "INTEGER", "minutes_url": "TEXT", "summary_url": "TEXT",
+                "minutes_title": "TEXT", "minutes_created_at": "INTEGER", "recording_status": "TEXT",
+                "integrity_note": "TEXT",
             }.items():
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE session_artifacts ADD COLUMN {name} {definition}")
@@ -201,21 +212,22 @@ class DeliveryLedger:
     def session_artifacts(self, session_id: str) -> dict[str, Any] | None:
         with self.lock:
             row = self.db.execute(
-                "SELECT archive_video_url, minutes_url, transcript_url, summary_url, video_name, "
-                "minutes_title, minutes_created_at FROM session_artifacts WHERE session_id=?",
+                "SELECT archive_video_url, archive_video_size, minutes_url, transcript_url, summary_url, video_name, "
+                "minutes_title, minutes_created_at, recording_status, integrity_note "
+                "FROM session_artifacts WHERE session_id=?",
                 (session_id,),
             ).fetchone()
         if not row:
             return None
         return dict(zip((
-            "archive_video_url", "minutes_url", "transcript_url", "summary_url", "video_name",
-            "minutes_title", "minutes_created_at",
+            "archive_video_url", "archive_video_size", "minutes_url", "transcript_url", "summary_url", "video_name",
+            "minutes_title", "minutes_created_at", "recording_status", "integrity_note",
         ), row))
 
     def save_session_artifacts(self, session_id: str, **artifacts: str | int) -> None:
         allowed = {
-            "archive_video_url", "minutes_url", "transcript_url", "summary_url", "video_name",
-            "minutes_title", "minutes_created_at",
+            "archive_video_url", "archive_video_size", "minutes_url", "transcript_url", "summary_url", "video_name",
+            "minutes_title", "minutes_created_at", "recording_status", "integrity_note",
         }
         unknown = set(artifacts) - allowed
         if unknown:
@@ -229,9 +241,11 @@ class DeliveryLedger:
                     (*artifacts.values(), session_id),
                 )
 
-    def save_uploaded_video(self, session_id: str, *, archive_video_url: str, video_name: str) -> None:
+    def save_uploaded_video(self, session_id: str, *, archive_video_url: str, archive_video_size: int,
+                            video_name: str) -> None:
         self.save_session_artifacts(
-            session_id, archive_video_url=archive_video_url, video_name=video_name,
+            session_id, archive_video_url=archive_video_url, archive_video_size=archive_video_size,
+            video_name=video_name,
         )
 
 
@@ -515,8 +529,137 @@ def concat_segments(segments: list[Path], output: Path) -> Path:
     return output
 
 
-def cleanup_uploaded_recordings(segments: list[Path], complete_video: Path) -> None:
-    """Remove only this session's MP4 files after durable Feishu archival."""
+def video_metadata(path: Path) -> VideoMetadata | None:
+    """Return local byte size and playable duration, or None for an invalid video."""
+    if not path.is_file() or path.stat().st_size < 1024:
+        return None
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        text=True, capture_output=True, check=False,
+    )
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError:
+        return None
+    if result.returncode != 0 or duration <= 0:
+        return None
+    return VideoMetadata(path.stat().st_size, duration)
+
+
+def stable_file_sizes(paths: list[Path], wait_seconds: float = 1.0) -> dict[Path, int]:
+    """Return sizes only after proving that every file stopped changing."""
+    before: dict[Path, os.stat_result] = {}
+    for path in paths:
+        try:
+            before[path] = path.stat()
+        except OSError as exc:
+            raise RecordingIntegrityError(f"文件大小校验失败：无法读取 {path.name}") from exc
+    if before and wait_seconds > 0:
+        time.sleep(wait_seconds)
+    sizes: dict[Path, int] = {}
+    for path, initial in before.items():
+        try:
+            current = path.stat()
+        except OSError as exc:
+            raise RecordingIntegrityError(f"文件大小校验失败：无法再次读取 {path.name}") from exc
+        if current.st_size != initial.st_size or current.st_mtime_ns != initial.st_mtime_ns:
+            raise RecordingIntegrityError(
+                f"文件大小校验失败：{path.name} 仍在写入（{initial.st_size} -> {current.st_size} 字节）"
+            )
+        sizes[path] = current.st_size
+    return sizes
+
+
+def inspect_recording_segments(segments: list[Path]) -> tuple[list[Path], list[VideoMetadata], list[Path]]:
+    valid: list[Path] = []
+    metadata: list[VideoMetadata] = []
+    invalid: list[Path] = []
+    try:
+        stable_sizes = stable_file_sizes(segments)
+    except RecordingIntegrityError:
+        # A changing final segment means recording has not safely finished yet.
+        raise
+    for segment in segments:
+        details = video_metadata(segment)
+        if details is None or details.size_bytes != stable_sizes.get(segment):
+            invalid.append(segment)
+        else:
+            valid.append(segment)
+            metadata.append(details)
+    return valid, metadata, invalid
+
+
+def recording_integrity_result(metadata: list[VideoMetadata], invalid: list[Path],
+                               expected_duration_seconds: float | None) -> tuple[str, str]:
+    captured = sum(item.duration_seconds for item in metadata)
+    notes: list[str] = []
+    if invalid:
+        notes.append("损坏分段：" + "、".join(path.name for path in invalid))
+    if expected_duration_seconds and expected_duration_seconds > 0:
+        tolerance = max(180.0, expected_duration_seconds * 0.05)
+        if captured + tolerance < expected_duration_seconds:
+            missing = max(0.0, expected_duration_seconds - captured)
+            notes.append(
+                f"有效录像 {captured / 60:.1f} 分钟，直播场次 {expected_duration_seconds / 60:.1f} 分钟，"
+                f"缺失约 {missing / 60:.1f} 分钟"
+            )
+    return ("部分录制", "；".join(notes)) if notes else ("已完成", "")
+
+
+def verify_merged_video(path: Path, segment_metadata: list[VideoMetadata]) -> VideoMetadata:
+    stable_size = stable_file_sizes([path]).get(path, 0)
+    merged = video_metadata(path)
+    if merged is None or merged.size_bytes != stable_size:
+        raise RecordingIntegrityError(f"上传前校验失败：合并录像不可读取或文件过小：{path.name}")
+    expected_duration = sum(item.duration_seconds for item in segment_metadata)
+    tolerance = max(5.0, len(segment_metadata) * 1.0)
+    if expected_duration and abs(merged.duration_seconds - expected_duration) > tolerance:
+        raise RecordingIntegrityError(
+            f"上传前校验失败：合并录像时长 {merged.duration_seconds:.1f} 秒，"
+            f"有效分段合计 {expected_duration:.1f} 秒"
+        )
+    return merged
+
+
+def drive_download_size(settings: Settings, file_token: str) -> int:
+    """Read the exact remote byte count without downloading the whole Drive file."""
+    response = requests.get(
+        f"https://open.feishu.cn/open-apis/drive/v1/files/{file_token}/download",
+        headers={"Authorization": f"Bearer {user_token(settings)}", "Range": "bytes=0-0"},
+        stream=True, timeout=60,
+    )
+    try:
+        response.raise_for_status()
+        content_range = response.headers.get("Content-Range", "")
+        if response.status_code != 206 or "/" not in content_range:
+            raise RecordingIntegrityError("飞书未返回可校验的录像文件大小")
+        return int(content_range.rsplit("/", 1)[-1])
+    except ValueError as exc:
+        raise RecordingIntegrityError("飞书返回了无效的录像文件大小") from exc
+    finally:
+        response.close()
+
+
+def verify_drive_file_size(settings: Settings, file_token: str, expected_size: int) -> None:
+    remote_size = drive_download_size(settings, file_token)
+    if remote_size != expected_size:
+        raise RecordingIntegrityError(
+            f"飞书上传校验失败：本地 {expected_size} 字节，云端 {remote_size} 字节；保留服务器录像"
+        )
+
+
+def cleanup_uploaded_recordings(segments: list[Path], complete_video: Path, verified_size: int) -> None:
+    """Delete local files only after the remote byte count has been verified."""
+    if not complete_video.exists() and not any(path.exists() for path in segments):
+        return
+    current_size = stable_file_sizes([complete_video]).get(complete_video, 0) if complete_video.exists() else 0
+    if complete_video.exists() and current_size != verified_size:
+        raise RecordingIntegrityError(
+            f"删除前校验失败：当前合并录像 {current_size} 字节，"
+            f"已验证上传录像 {verified_size} 字节"
+        )
+    if not complete_video.exists() and any(path.exists() for path in segments):
+        raise RecordingIntegrityError("删除前校验失败：合并录像不存在，保留原始分段")
     for path in [*segments, complete_video]:
         try:
             path.unlink(missing_ok=True)
@@ -525,16 +668,7 @@ def cleanup_uploaded_recordings(segments: list[Path], complete_video: Path) -> N
 
 
 def video_is_readable(path: Path) -> bool:
-    if not path.is_file() or path.stat().st_size < 1024:
-        return False
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
-        text=True, capture_output=True, check=False,
-    )
-    try:
-        return result.returncode == 0 and float(result.stdout.strip()) > 0
-    except ValueError:
-        return False
+    return video_metadata(path) is not None
 
 
 def ensure_merge_space(segments: list[Path], output_dir: Path, reserve_bytes: int = 512 * 1024 * 1024) -> None:
@@ -602,15 +736,16 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
     """Upload a file with a durable per-part checkpoint for interrupted transfers."""
     if not path.is_file():
         raise RuntimeError(f"Artifact does not exist: {path}")
-    stat = path.stat()
+    stable_file_sizes([path])
+    initial_stat = path.stat()
     checkpoint_path = _upload_checkpoint_path(path)
     checkpoint: dict[str, Any] = {}
     if checkpoint_path.is_file():
         try:
             candidate = json.loads(checkpoint_path.read_text(encoding="utf-8"))
             if (
-                candidate.get("file_size") == stat.st_size
-                and candidate.get("file_mtime_ns") == stat.st_mtime_ns
+                candidate.get("file_size") == initial_stat.st_size
+                and candidate.get("file_mtime_ns") == initial_stat.st_mtime_ns
                 and candidate.get("folder_token") == folder_token
             ):
                 checkpoint = candidate
@@ -618,7 +753,8 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
             checkpoint = {}
     if not checkpoint:
         prepared = user_feishu_request(settings, "POST", "/drive/v1/files/upload_prepare", body={
-            "file_name": path.name, "parent_type": "explorer", "parent_node": folder_token, "size": stat.st_size,
+            "file_name": path.name, "parent_type": "explorer", "parent_node": folder_token,
+            "size": initial_stat.st_size,
         }).get("data", {})
         upload_id = prepared.get("upload_id")
         block_size = int(prepared.get("block_size", 0))
@@ -627,7 +763,8 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
             raise RuntimeError("Feishu did not prepare the file upload")
         checkpoint = {
             "upload_id": str(upload_id), "block_size": block_size, "block_num": block_num,
-            "file_size": stat.st_size, "file_mtime_ns": stat.st_mtime_ns, "folder_token": folder_token,
+            "file_size": initial_stat.st_size, "file_mtime_ns": initial_stat.st_mtime_ns,
+            "folder_token": folder_token,
             "completed_parts": [],
         }
         _write_upload_checkpoint(checkpoint_path, checkpoint)
@@ -671,11 +808,29 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
     pending_parts = [sequence for sequence in range(block_num) if sequence not in completed_parts]
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(pending_parts) or 1)) as executor:
         list(executor.map(upload_part, pending_parts))
-    finished = user_feishu_request(settings, "POST", "/drive/v1/files/upload_finish",
-                                   body={"upload_id": upload_id, "block_num": block_num}).get("data", {})
-    file_token = finished.get("file_token")
+    current_stat = path.stat()
+    if (
+        current_stat.st_size != initial_stat.st_size
+        or current_stat.st_mtime_ns != initial_stat.st_mtime_ns
+    ):
+        raise RecordingIntegrityError(
+            f"上传前后校验失败：{path.name} 在上传期间发生变化；保留服务器录像"
+        )
+    file_token = checkpoint.get("file_token")
+    if not file_token:
+        finished = user_feishu_request(settings, "POST", "/drive/v1/files/upload_finish",
+                                       body={"upload_id": upload_id, "block_num": block_num}).get("data", {})
+        file_token = finished.get("file_token")
+        if file_token:
+            # Keep the cloud token until byte verification succeeds. A retry can
+            # then verify this exact file instead of finishing or uploading twice.
+            checkpoint["file_token"] = str(file_token)
+            _write_upload_checkpoint(checkpoint_path, checkpoint)
     if not file_token:
         raise RuntimeError("Feishu did not return the uploaded file token")
+    # Upload_finish proves all declared blocks arrived. The ranged download
+    # additionally proves that the assembled cloud file has the exact local size.
+    verify_drive_file_size(settings, str(file_token), initial_stat.st_size)
     checkpoint_path.unlink(missing_ok=True)
     return str(file_token)
 
@@ -911,11 +1066,25 @@ def publish_finished_session(
 def complete_with_feishu_minutes(
     settings: Settings, *, room_dir: Path, segments: list[Path], account_name: str, session_id: str,
     record_id: str, title: str, url: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
+    expected_duration_seconds: float | None = None,
 ) -> None:
     """Create one complete video, archive it, transcribe it in Minutes, then publish once."""
     complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
     artifacts = ledger.session_artifacts(session_id) or {}
+    valid_segments, segment_metadata, invalid_segments = inspect_recording_segments(segments)
+    recording_status = str(artifacts.get("recording_status") or "已完成")
+    integrity_note = str(artifacts.get("integrity_note") or "")
+    if segments:
+        if not valid_segments:
+            raise RecordingIntegrityError("录制结束校验失败：没有可读取的录像分段")
+        recording_status, integrity_note = recording_integrity_result(
+            segment_metadata, invalid_segments, expected_duration_seconds,
+        )
+        ledger.save_session_artifacts(
+            session_id, recording_status=recording_status, integrity_note=integrity_note,
+        )
     archive_video_url = artifacts.get("archive_video_url", "")
+    archive_video_size = int(artifacts.get("archive_video_size") or 0)
     video_name = artifacts.get("video_name", "")
     if not archive_video_url:
         with _VIDEO_ARCHIVE_LOCK:
@@ -923,20 +1092,36 @@ def complete_with_feishu_minutes(
             # task waited for the bounded disk-intensive archive section.
             artifacts = ledger.session_artifacts(session_id) or {}
             archive_video_url = artifacts.get("archive_video_url", "")
+            archive_video_size = int(artifacts.get("archive_video_size") or 0)
             video_name = artifacts.get("video_name", "")
             if not archive_video_url:
                 if not video_is_readable(complete_video):
-                    ensure_merge_space(segments, room_dir)
-                    concat_segments(segments, complete_video)
-                update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
+                    ensure_merge_space(valid_segments, room_dir)
+                    concat_segments(valid_segments, complete_video)
+                merged_metadata = verify_merged_video(complete_video, segment_metadata)
+                update_live_record(settings, record_id, {
+                    "录制状态": recording_status, "转写状态": "转写中", "失败原因": integrity_note,
+                })
                 archive_folder = session_drive_folder(settings, account_name)
                 video_token = upload_drive_file(settings, complete_video, archive_folder)
+                archive_video_size = merged_metadata.size_bytes
                 archive_video_url = drive_file_url(video_token)
                 video_name = complete_video.name
                 ledger.save_uploaded_video(
-                    session_id, archive_video_url=archive_video_url, video_name=video_name,
+                    session_id, archive_video_url=archive_video_url, archive_video_size=archive_video_size,
+                    video_name=video_name,
                 )
-    cleanup_uploaded_recordings(segments, complete_video)
+    video_token = archive_video_url.rstrip("/").rsplit("/", 1)[-1]
+    if archive_video_size <= 0:
+        if complete_video.exists():
+            archive_video_size = complete_video.stat().st_size
+            verify_drive_file_size(settings, video_token, archive_video_size)
+            ledger.save_session_artifacts(session_id, archive_video_size=archive_video_size)
+        elif segments:
+            raise RecordingIntegrityError("删除前校验失败：缺少已上传录像的本地大小凭证，保留原始分段")
+    else:
+        verify_drive_file_size(settings, video_token, archive_video_size)
+    cleanup_uploaded_recordings(segments, complete_video, archive_video_size)
 
     artifacts = ledger.session_artifacts(session_id) or artifacts
     transcript_url = artifacts.get("transcript_url", "")
@@ -976,8 +1161,8 @@ def complete_with_feishu_minutes(
         settings, record_id, minutes_url=minutes_url, transcript_url=transcript_url, summary_url=summary_url,
     )
     update_live_record(settings, record_id, {
-        "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送中",
-        "失败原因": "",
+        "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "发送中",
+        "失败原因": integrity_note,
     })
     try:
         publish_finished_session(
@@ -987,13 +1172,13 @@ def complete_with_feishu_minutes(
         )
     except Exception as exc:
         update_live_record(settings, record_id, {
-            "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送失败",
-            "失败原因": str(exc)[:1000],
+            "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "发送失败",
+            "失败原因": (integrity_note + "；" if integrity_note else "") + str(exc)[:1000],
         })
         raise CompletionNotificationError(str(exc)) from exc
     update_live_record(settings, record_id, {
-        "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "已发送",
-        "完成提醒时间": int(time.time() * 1000), "失败原因": "",
+        "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "已发送",
+        "完成提醒时间": int(time.time() * 1000), "失败原因": integrity_note,
     })
 
 
@@ -1151,6 +1336,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                                 settings, room_dir=room_dir, segments=segments, account_name=snap_name,
                                 session_id=session_stamp or "unknown", record_id=record_id,
                                 title=info.get("title", ""), url=url, recipients=snap_recipients, ledger=ledger,
+                                expected_duration_seconds=max(0.0, (ended_ms - started_ms) / 1000),
                             )
                         except CompletionNotificationError:
                             raise
