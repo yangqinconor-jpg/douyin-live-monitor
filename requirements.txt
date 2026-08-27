@@ -1,3 +1,2 @@
 requests>=2.31.0
 openai-whisper
-python-docx>=1.1.2
