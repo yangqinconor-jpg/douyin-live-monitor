@@ -31,9 +31,28 @@ recording_active() {
   pgrep -af '[f]fmpeg' | grep -F -- '-f segment' | grep -Fq 'recordings/'
 }
 
+session_active() {
+  /opt/douyin-live-monitor/.venv/bin/python - "$STATE_DB" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+row = conn.execute("SELECT EXISTS(SELECT 1 FROM sessions WHERE active=1)").fetchone()
+raise SystemExit(0 if row and row[0] else 1)
+PY
+}
+
+recovery_active() {
+  pgrep -af '[r]ecover_failed_session.py' >/dev/null
+}
+
+processing_active() {
+  pgrep -x ffmpeg >/dev/null || recovery_active || session_active
+}
+
 while true; do
-  while recording_active; do
-    echo "A recording process is still active; checking again in 60 seconds."
+  while recording_active || processing_active; do
+    echo "A live session or post-processing task is still active; checking again in 60 seconds."
     sleep 60
   done
 
@@ -41,7 +60,7 @@ while true; do
   # restart. Existing recording workers are not affected by this gate.
   set_deployment_gate 1
   sleep 75
-  if recording_active; then
+  if recording_active || processing_active; then
     set_deployment_gate 0
     continue
   fi
@@ -49,11 +68,6 @@ while true; do
 done
 
 trap 'set_deployment_gate 0' EXIT
-
-while pgrep -x ffmpeg >/dev/null; do
-  echo "Video processing is still active; checking again in 10 seconds."
-  sleep 10
-done
 
 install -o douyin-live -g douyin-live -m 644 "$STAGED_FILE" "$TARGET_FILE"
 rm -f "$STAGED_FILE"
