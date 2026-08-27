@@ -473,28 +473,12 @@ def update_live_record(settings: Settings, record_id: str, fields: dict[str, Any
         print(f"Live record update failed: {exc}", flush=True)
 
 
-def upload_bitable_attachment(settings: Settings, path: Path) -> str | None:
-    """Upload an artifact for a Bitable attachment field and return its token."""
-    token = tenant_token(settings)
-    if not token or not settings.bitable_app_token or not path.exists():
-        return None
-    with path.open("rb") as handle:
-        response = requests.post(
-            "https://open.feishu.cn/open-apis/drive/v1/medias/upload_all",
-            headers={"Authorization": f"Bearer {token}"},
-            data={"file_name": path.name, "parent_type": "bitable_file", "parent_node": settings.bitable_app_token, "size": str(path.stat().st_size)},
-            files={"file": (path.name, handle)}, timeout=300,
-        )
-    return feishu_response_data(response).get("data", {}).get("file_token")
-
-
-def attach_session_artifacts(settings: Settings, record_id: str, screenshot: Path, *, transcript_url: str = "",
-                             summary_url: str = "") -> None:
-    """Attach the screenshot and write the durable Feishu links for a session."""
+def attach_session_artifacts(settings: Settings, record_id: str, *, minutes_url: str = "",
+                             transcript_url: str = "", summary_url: str = "") -> None:
+    """Write the three Feishu-generated session links to the live record."""
     fields: dict[str, Any] = {}
-    image_token = upload_bitable_attachment(settings, screenshot)
-    if image_token:
-        fields["截图"] = [{"file_token": image_token, "name": screenshot.name}]
+    if minutes_url:
+        fields["录制视频链接"] = {"link": minutes_url, "text": "打开录制视频"}
     if summary_url:
         fields["智能纪要链接"] = {"link": summary_url, "text": "打开智能纪要"}
     if transcript_url:
@@ -871,14 +855,6 @@ def artifact_path(directory: Path, kind: str, account_id: str, session_id: str, 
     return directory / f"{kind}-{account_id}-{artifact_timestamp(session_id)}{suffix}"
 
 
-def capture_screenshot(video: Path, screenshot: Path) -> None:
-    """Capture a readable frame near the beginning of the first recording segment."""
-    subprocess.run([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "5", "-i", str(video),
-        "-frames:v", "1", "-vf", "scale='min(1280,iw)':-2", "-q:v", "3", str(screenshot),
-    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
 def recording_complete_message(account_name: str, session_id: str, minutes_url: str, transcript_url: str,
                                summary_url: str) -> str:
     """Build the single post-processing notification required for a live session."""
@@ -937,7 +913,6 @@ def complete_with_feishu_minutes(
     record_id: str, title: str, url: str, recipients: list[dict[str, str]], ledger: DeliveryLedger,
 ) -> None:
     """Create one complete video, archive it, transcribe it in Minutes, then publish once."""
-    screenshot = artifact_path(room_dir, "直播截图", account_name, session_id, ".jpg")
     complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
     artifacts = ledger.session_artifacts(session_id) or {}
     archive_video_url = artifacts.get("archive_video_url", "")
@@ -953,8 +928,6 @@ def complete_with_feishu_minutes(
                 if not video_is_readable(complete_video):
                     ensure_merge_space(segments, room_dir)
                     concat_segments(segments, complete_video)
-                if not screenshot.is_file():
-                    capture_screenshot(complete_video, screenshot)
                 update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
                 archive_folder = session_drive_folder(settings, account_name)
                 video_token = upload_drive_file(settings, complete_video, archive_folder)
@@ -1000,7 +973,7 @@ def complete_with_feishu_minutes(
         summary_url = str(minutes_artifacts["summary_url"])
         ledger.save_session_artifacts(session_id, **minutes_artifacts)
     attach_session_artifacts(
-        settings, record_id, screenshot, transcript_url=transcript_url, summary_url=summary_url,
+        settings, record_id, minutes_url=minutes_url, transcript_url=transcript_url, summary_url=summary_url,
     )
     update_live_record(settings, record_id, {
         "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送中",
@@ -1209,10 +1182,6 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                         settings, account_name=snap_name, session_id=session_stamp or "unknown",
                         minutes_url=str(first_segment), transcript_url=str(full_path), summary_url="",
                         recipients=snap_recipients, ledger=ledger,
-                    )
-                    attach_session_artifacts(
-                        settings, record_id,
-                        artifact_path(room_dir, "直播截图", snap_name, session_stamp or "unknown", ".jpg"),
                     )
                 update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "已发送", "完成提醒时间": int(time.time() * 1000)})
                 print(f"Live finished: {url}; {len(segments)} segments, {len(full)} chars", flush=True)
