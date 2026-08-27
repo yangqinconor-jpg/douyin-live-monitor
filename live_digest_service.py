@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -450,6 +452,19 @@ def cleanup_uploaded_recordings(segments: list[Path], complete_video: Path) -> N
             print(f"Uploaded recording cleanup failed for {path}: {exc}", flush=True)
 
 
+def video_is_readable(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 1024:
+        return False
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        text=True, capture_output=True, check=False,
+    )
+    try:
+        return result.returncode == 0 and float(result.stdout.strip()) > 0
+    except ValueError:
+        return False
+
+
 def ensure_merge_space(segments: list[Path], output_dir: Path, reserve_bytes: int = 512 * 1024 * 1024) -> None:
     required = sum(path.stat().st_size for path in segments) + reserve_bytes
     available = shutil.disk_usage(output_dir).free
@@ -512,17 +527,35 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
     if not upload_id or block_size <= 0 or block_num <= 0:
         raise RuntimeError("Feishu did not prepare the file upload")
     token = user_token(settings)
-    with path.open("rb") as source:
-        for sequence in range(block_num):
+
+    def upload_part(sequence: int) -> None:
+        with path.open("rb") as source:
+            source.seek(sequence * block_size)
             block = source.read(block_size)
-            if not block:
-                raise RuntimeError("Recording ended before all upload blocks were read")
-            response = requests.post(
-                f"https://open.feishu.cn/open-apis/drive/v1/files/{upload_id}/upload_part",
-                headers={"Authorization": f"Bearer {token}"}, params={"seq": sequence},
-                files={"file": (path.name, block)}, timeout=300,
-            )
-            feishu_response_data(response)
+        if not block:
+            raise RuntimeError("Recording ended before all upload blocks were read")
+        for attempt in range(1, 6):
+            try:
+                response = requests.post(
+                    "https://open.feishu.cn/open-apis/drive/v1/files/upload_part",
+                    headers={"Authorization": f"Bearer {token}"},
+                    data={
+                        "upload_id": upload_id,
+                        "seq": str(sequence),
+                        "size": str(len(block)),
+                        "checksum": str(zlib.adler32(block) & 0xFFFFFFFF),
+                    },
+                    files={"file": (path.name, block)}, timeout=300,
+                )
+                feishu_response_data(response)
+                return
+            except requests.RequestException:
+                if attempt == 5:
+                    raise
+                time.sleep(min(30, 2 ** attempt))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, block_num)) as executor:
+        list(executor.map(upload_part, range(block_num)))
     finished = user_feishu_request(settings, "POST", "/drive/v1/files/upload_finish",
                                    body={"upload_id": upload_id, "block_num": block_num}).get("data", {})
     file_token = finished.get("file_token")
@@ -764,9 +797,11 @@ def complete_with_feishu_minutes(
             video_url = artifacts.get("video_url", "")
             video_name = artifacts.get("video_name", "")
             if not video_url:
-                ensure_merge_space(segments, room_dir)
-                concat_segments(segments, complete_video)
-                capture_screenshot(complete_video, screenshot)
+                if not video_is_readable(complete_video):
+                    ensure_merge_space(segments, room_dir)
+                    concat_segments(segments, complete_video)
+                if not screenshot.is_file():
+                    capture_screenshot(complete_video, screenshot)
                 update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
                 archive_folder = session_drive_folder(settings, account_name)
                 video_token = upload_drive_file(settings, complete_video, archive_folder)

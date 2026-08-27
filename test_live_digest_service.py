@@ -8,6 +8,7 @@ from live_digest_service import (
     attach_session_artifacts, cleanup_uploaded_recordings, complete_with_feishu_minutes, concat_segments,
     create_live_record, drive_file_url, ensure_merge_space, message_url,
     recording_complete_message, recording_complete_post, send_post, session_segments, sync_accounts,
+    upload_drive_file, video_is_readable,
 )
 
 
@@ -118,6 +119,40 @@ class FeishuConfigTest(unittest.TestCase):
             with self.assertRaises(LowDiskSpaceError):
                 ensure_merge_space([segment], Path(directory), reserve_bytes=1024)
 
+    @patch("live_digest_service.subprocess.run")
+    def test_existing_complete_video_is_reused_only_when_readable(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "complete.mp4"
+            video.write_bytes(b"x" * 1024)
+            run.return_value = unittest.mock.Mock(returncode=0, stdout="123.4\n")
+            self.assertTrue(video_is_readable(video))
+            run.return_value = unittest.mock.Mock(returncode=1, stdout="")
+            self.assertFalse(video_is_readable(video))
+
+    @patch("live_digest_service.user_feishu_request")
+    @patch("live_digest_service.user_token", return_value="token")
+    @patch("live_digest_service.requests.post")
+    def test_drive_upload_retries_a_transient_part_failure(self, post, _token, request):
+        request.side_effect = [
+            {"data": {"upload_id": "upload", "block_size": 4, "block_num": 1}},
+            {"data": {"file_token": "file-token"}},
+        ]
+        success = unittest.mock.Mock()
+        success.raise_for_status.return_value = None
+        success.json.return_value = {"code": 0, "data": {}}
+        post.side_effect = [__import__("requests").exceptions.SSLError("temporary"), success]
+        with tempfile.TemporaryDirectory() as directory, patch("live_digest_service.time.sleep"):
+            video = Path(directory) / "video.mp4"
+            video.write_bytes(b"data")
+            self.assertEqual(upload_drive_file(Settings(Path("."), Path("."), ""), video, "folder"), "file-token")
+        self.assertEqual(post.call_count, 2)
+        _, kwargs = post.call_args
+        self.assertEqual(post.call_args.args[0], "https://open.feishu.cn/open-apis/drive/v1/files/upload_part")
+        self.assertEqual(kwargs["data"], {
+            "upload_id": "upload", "seq": "0", "size": "4", "checksum": "67109275",
+        })
+        self.assertNotIn("params", kwargs)
+
     def test_final_video_is_not_treated_as_an_unmerged_segment(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -210,6 +245,7 @@ class FeishuConfigTest(unittest.TestCase):
     @patch("live_digest_service.update_live_record")
     @patch("live_digest_service.attach_session_artifacts")
     @patch("live_digest_service.cleanup_uploaded_recordings")
+    @patch("live_digest_service.video_is_readable", return_value=False)
     @patch("live_digest_service.publish_finished_session", side_effect=[RuntimeError("network"), None])
     @patch("live_digest_service.upload_drive_file", side_effect=["video-token", "transcript-token"])
     @patch("live_digest_service.create_transcript_docx")
@@ -220,7 +256,7 @@ class FeishuConfigTest(unittest.TestCase):
     @patch("live_digest_service.capture_screenshot")
     @patch("live_digest_service.concat_segments")
     def test_notification_retry_reuses_finished_artifacts(self, _concat, _screenshot, _folder, _urls, _minutes,
-                                                          _transcript, _docx, uploads, _publish, cleanup, _attach, _update):
+                                                          _transcript, _docx, uploads, _publish, _readable, cleanup, _attach, _update):
         with tempfile.TemporaryDirectory() as directory:
             room = Path(directory)
             ledger = DeliveryLedger(room / "state.sqlite3")
