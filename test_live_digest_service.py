@@ -216,6 +216,17 @@ class FeishuConfigTest(unittest.TestCase):
     def test_drive_file_link_is_clickable(self):
         self.assertEqual(drive_file_url("file-token"), "https://shenyidushu.feishu.cn/drive/file/file-token")
 
+    @patch("live_digest_service.user_feishu_request")
+    def test_minutes_token_is_derived_from_returned_url(self, request):
+        request.return_value = {"code": 0, "data": {
+            "minute_url": "https://shenyidushu.feishu.cn/minutes/minute-token",
+        }}
+        from live_digest_service import upload_minutes
+        self.assertEqual(
+            upload_minutes(Settings(Path("."), Path("."), ""), "file-token"),
+            ("minute-token", "https://shenyidushu.feishu.cn/minutes/minute-token"),
+        )
+
     def test_completion_message_contains_all_three_finished_assets(self):
         message = recording_complete_message(
             "示例账号", "20260826_102012", "https://video", "https://transcript", "https://minutes",
@@ -298,6 +309,31 @@ class FeishuConfigTest(unittest.TestCase):
             complete_with_feishu_minutes(settings, **args)
             self.assertEqual(uploads.call_count, 2)
             self.assertEqual(cleanup.call_count, 2)
+
+    @patch("live_digest_service.publish_finished_session")
+    @patch("live_digest_service.update_live_record")
+    @patch("live_digest_service.attach_session_artifacts")
+    @patch("live_digest_service.upload_drive_file", return_value="transcript-token")
+    @patch("live_digest_service.create_transcript_docx")
+    @patch("live_digest_service.wait_for_transcript", return_value="transcript")
+    @patch("live_digest_service.upload_minutes")
+    @patch("live_digest_service.session_drive_folder", return_value="folder")
+    @patch("live_digest_service.cleanup_uploaded_recordings")
+    def test_minutes_checkpoint_is_reused_without_creating_a_duplicate(
+        self, _cleanup, _folder, minutes, _wait, _docx, _upload, _attach, _update, _publish,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = DeliveryLedger(Path(directory) / "state.sqlite3")
+            ledger.save_session_artifacts(
+                "session", video_url="https://drive/file/video", transcript_url="",
+                minute_url="https://tenant/minutes/minute-token", video_name="video.mp4", transcript_name="",
+            )
+            complete_with_feishu_minutes(
+                Settings(Path("."), Path(directory), ""), room_dir=Path(directory), segments=[],
+                account_name="账号", session_id="session", record_id="record", title="", url="",
+                recipients=[], ledger=ledger,
+            )
+        minutes.assert_not_called()
 
 
 if __name__ == "__main__":

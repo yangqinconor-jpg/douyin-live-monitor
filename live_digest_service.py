@@ -608,8 +608,8 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
 
 def upload_minutes(settings: Settings, file_token: str) -> tuple[str, str]:
     data = user_feishu_request(settings, "POST", "/minutes/v1/minutes/upload", body={"file_token": file_token}).get("data", {})
-    token = data.get("minute_token")
     url = data.get("minute_url")
+    token = data.get("minute_token") or (str(url).rstrip("/").rsplit("/", 1)[-1] if url else "")
     if not token or not url:
         raise RuntimeError("Feishu did not create a Minutes record for this video")
     return str(token), str(url)
@@ -852,13 +852,21 @@ def complete_with_feishu_minutes(
                 ledger.save_uploaded_video(session_id, video_url=video_url, video_name=video_name)
     cleanup_uploaded_recordings(segments, complete_video)
 
+    artifacts = ledger.session_artifacts(session_id) or artifacts
     transcript_url = artifacts.get("transcript_url", "")
     minute_url = artifacts.get("minute_url", "")
     transcript_name = artifacts.get("transcript_name", "")
-    if not (transcript_url and minute_url):
+    if not transcript_url:
         archive_folder = session_drive_folder(settings, account_name)
-        video_token = video_url.rstrip("/").rsplit("/", 1)[-1]
-        minute_token, minute_url = upload_minutes(settings, video_token)
+        if minute_url:
+            minute_token = minute_url.rstrip("/").rsplit("/", 1)[-1]
+        else:
+            video_token = video_url.rstrip("/").rsplit("/", 1)[-1]
+            minute_token, minute_url = upload_minutes(settings, video_token)
+            ledger.save_session_artifacts(
+                session_id, video_url=video_url, transcript_url="", minute_url=minute_url,
+                video_name=video_name, transcript_name="",
+            )
         transcript_text = wait_for_transcript(settings, minute_token)
         transcript_docx = artifact_path(room_dir, "直播逐字稿", account_name, session_id, ".docx")
         create_transcript_docx(transcript_docx, account_name, session_id, transcript_text)
