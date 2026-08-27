@@ -413,7 +413,7 @@ def concat_segments(segments: list[Path], output: Path) -> Path:
         concat_file = Path(handle.name)
         for segment in segments:
             # ffconcat requires single quotes to be escaped in file paths.
-            handle.write(f"file '{str(segment.resolve()).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\\n")
+            handle.write(f"file '{str(segment.resolve()).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
     try:
         fast_command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
                         "-i", str(concat_file), "-c", "copy", "-movflags", "+faststart", str(output)]
@@ -425,6 +425,15 @@ def concat_segments(segments: list[Path], output: Path) -> Path:
     finally:
         concat_file.unlink(missing_ok=True)
     return output
+
+
+def cleanup_uploaded_recordings(segments: list[Path], complete_video: Path) -> None:
+    """Remove only this session's MP4 files after durable Feishu archival."""
+    for path in [*segments, complete_video]:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"Uploaded recording cleanup failed for {path}: {exc}", flush=True)
 
 
 def drive_list(settings: Settings, folder_token: str) -> list[dict[str, Any]]:
@@ -720,6 +729,7 @@ def complete_with_feishu_minutes(
 ) -> None:
     """Create one complete video, archive it, transcribe it in Minutes, then publish once."""
     screenshot = artifact_path(room_dir, "直播截图", account_name, session_id, ".jpg")
+    complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
     completed = ledger.session_artifacts(session_id)
     if completed:
         video_url = completed["video_url"]
@@ -728,7 +738,6 @@ def complete_with_feishu_minutes(
         video_name = completed["video_name"]
         transcript_name = completed["transcript_name"]
     else:
-        complete_video = artifact_path(room_dir, "直播视频", account_name, session_id, "_00.mp4")
         concat_segments(segments, complete_video)
         capture_screenshot(complete_video, screenshot)
         update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "转写中"})
@@ -748,6 +757,7 @@ def complete_with_feishu_minutes(
             session_id, video_url=video_url, transcript_url=transcript_url, minute_url=minute_url,
             video_name=video_name, transcript_name=transcript_name,
         )
+    cleanup_uploaded_recordings(segments, complete_video)
 
     attach_session_artifacts(settings, record_id, screenshot, minute_url=minute_url, transcript_url=transcript_url)
     update_live_record(settings, record_id, {
