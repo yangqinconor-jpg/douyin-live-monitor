@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from live_digest_service import (
     Account, CompletionNotificationError, DeliveryLedger, Settings, artifact_path, attach_session_artifacts,
-    complete_with_feishu_minutes, concat_segments, create_live_record, drive_file_url, message_url,
+    cleanup_uploaded_recordings, complete_with_feishu_minutes, concat_segments, create_live_record, drive_file_url, message_url,
     recording_complete_message, recording_complete_post, send_post, session_segments, sync_accounts,
 )
 
@@ -68,7 +68,15 @@ class FeishuConfigTest(unittest.TestCase):
 
     @patch("live_digest_service.subprocess.run")
     def test_multiple_segments_are_merged_with_ffconcat(self, run):
-        run.return_value.returncode = 0
+        manifests = []
+
+        def capture_manifest(command, **_kwargs):
+            manifests.append(Path(command[command.index("-i") + 1]).read_text(encoding="utf-8"))
+            result = unittest.mock.Mock()
+            result.returncode = 0
+            return result
+
+        run.side_effect = capture_manifest
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             first = folder / "直播视频-示例账号-2026-08-26_10-00-12_000.mp4"
@@ -82,6 +90,23 @@ class FeishuConfigTest(unittest.TestCase):
         self.assertIn("-c", command)
         self.assertIn("copy", command)
         self.assertEqual(command[-1], str(output))
+        self.assertEqual(len(manifests[0].splitlines()), 2)
+        self.assertNotIn("\\nfile", manifests[0])
+
+    def test_cleanup_removes_only_uploaded_session_recordings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            first = folder / "session_000.mp4"
+            second = folder / "session_001.mp4"
+            complete = folder / "session_00.mp4"
+            current_recording = folder / "current_000.mp4"
+            for path in (first, second, complete, current_recording):
+                path.touch()
+            cleanup_uploaded_recordings([first, second], complete)
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertFalse(complete.exists())
+            self.assertTrue(current_recording.exists())
 
     def test_final_video_is_not_treated_as_an_unmerged_segment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -174,6 +199,7 @@ class FeishuConfigTest(unittest.TestCase):
 
     @patch("live_digest_service.update_live_record")
     @patch("live_digest_service.attach_session_artifacts")
+    @patch("live_digest_service.cleanup_uploaded_recordings")
     @patch("live_digest_service.publish_finished_session", side_effect=[RuntimeError("network"), None])
     @patch("live_digest_service.upload_drive_file", side_effect=["video-token", "transcript-token"])
     @patch("live_digest_service.create_transcript_docx")
@@ -184,7 +210,7 @@ class FeishuConfigTest(unittest.TestCase):
     @patch("live_digest_service.capture_screenshot")
     @patch("live_digest_service.concat_segments")
     def test_notification_retry_reuses_finished_artifacts(self, _concat, _screenshot, _folder, _urls, _minutes,
-                                                          _transcript, _docx, uploads, _publish, _attach, _update):
+                                                          _transcript, _docx, uploads, _publish, cleanup, _attach, _update):
         with tempfile.TemporaryDirectory() as directory:
             room = Path(directory)
             ledger = DeliveryLedger(room / "state.sqlite3")
@@ -194,6 +220,7 @@ class FeishuConfigTest(unittest.TestCase):
                 complete_with_feishu_minutes(settings, **args)
             complete_with_feishu_minutes(settings, **args)
             self.assertEqual(uploads.call_count, 2)
+            self.assertEqual(cleanup.call_count, 2)
 
 
 if __name__ == "__main__":
