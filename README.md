@@ -4,6 +4,8 @@
 [DouyinLiveRecorder](https://github.com/ihmily/DouyinLiveRecorder) 解析直播流，用 FFmpeg
 分段录制，下播后合并完整录像，通过飞书妙记转写，并由飞书应用机器人通知指定用户。
 
+完整的功能变更和线上修复记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 功能
 
 - 同时监控多个抖音直播间，默认每 60 秒轮询一次。
