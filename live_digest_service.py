@@ -165,11 +165,15 @@ class DeliveryLedger:
             try:
                 self.db.execute("BEGIN IMMEDIATE")
                 row = self.db.execute(
-                    "SELECT status, minutes_url FROM minutes_submissions WHERE session_id=?", (session_id,),
+                    "SELECT status, minutes_url, updated_at > datetime('now', '-10 minutes') "
+                    "FROM minutes_submissions WHERE session_id=?", (session_id,),
                 ).fetchone()
-                if row and row[0] in {"submitting", "completed"}:
+                if row and row[0] == "completed":
                     self.db.commit()
                     return False, str(row[1] or "")
+                if row and row[0] == "submitting" and row[2]:
+                    self.db.commit()
+                    return False, ""
                 self.db.execute(
                     "INSERT INTO minutes_submissions VALUES(?, 'submitting', '', '', datetime('now')) "
                     "ON CONFLICT(session_id) DO UPDATE SET status='submitting', minutes_url='', "
@@ -838,6 +842,7 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
                     completed_parts.add(sequence)
                     checkpoint["completed_parts"] = sorted(completed_parts)
                     _write_upload_checkpoint(checkpoint_path, checkpoint)
+                report_progress()
                 return
             except requests.RequestException:
                 if attempt == 5:
@@ -848,6 +853,29 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
     # A large recording is split into thousands of parts; a small bounded
     # worker pool keeps uploads moving without creating an unbounded request
     # burst against Feishu.
+    progress_lock = threading.Lock()
+    last_reported_count = len(completed_parts)
+    last_progress_report = time.monotonic()
+
+    def report_progress() -> None:
+        nonlocal last_reported_count, last_progress_report
+        with progress_lock:
+            progress_count = len(completed_parts)
+            now = time.monotonic()
+            if progress_count == block_num or progress_count - last_reported_count >= 50 or now - last_progress_report >= 30:
+                print(
+                    f"Feishu upload progress: {path.name} {progress_count}/{block_num} "
+                    f"({progress_count / block_num * 100:.1f}%)",
+                    flush=True,
+                )
+                last_reported_count = progress_count
+                last_progress_report = now
+
+    print(
+        f"Feishu upload started: {path.name}; resuming {len(completed_parts)}/{block_num} parts",
+        flush=True,
+    )
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(pending_parts) or 1)) as executor:
         list(executor.map(upload_part, pending_parts))
     current_stat = path.stat()
@@ -1343,6 +1371,11 @@ def recorder_is_stalled(
     return now - latest_mtime >= stall_seconds
 
 
+def session_account_name(snapshot: dict[str, Any] | None, fallback: str) -> str:
+    """Keep one account-name snapshot for every segment in a live session."""
+    return str((snapshot or {}).get("account_name") or fallback)
+
+
 def run_room(settings: Settings, account_id: str, registry: dict[str, Account], registry_lock: threading.Lock, ledger: DeliveryLedger) -> None:
     room_dir = settings.output_dir / account_id
     room_dir.mkdir(parents=True, exist_ok=True)
@@ -1376,7 +1409,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 # data so its next attempt can use a fresh URL.
                 print(f"{account_id}: stream lookup failed: {exc}", flush=True)
                 if active and process and recorder_is_stalled(
-                    process, room_dir, (session_snapshot or {}).get("account_name", account.name),
+                    process, room_dir, session_account_name(session_snapshot, account.name),
                     session_stamp or "unknown", process_started_at,
                     stall_seconds=settings.recorder_stall_seconds,
                     startup_grace_seconds=settings.recorder_startup_grace_seconds,
@@ -1420,8 +1453,9 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 exit_code = process.returncode
                 ledger.record_recorder_stop(account_id, int(time.time() * 1000))
                 time.sleep(settings.recorder_restart_backoff_seconds)
+                snap_name = session_account_name(session_snapshot, account.name)
                 process = start_recorder(
-                    settings, room_dir, account.name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    settings, room_dir, snap_name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
                     record_url,
                 )
                 process_started_at = time.time()
@@ -1436,18 +1470,19 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 print(f"Recorder stalled; restarting: {url}", flush=True)
                 stop_recorder(process)
                 time.sleep(settings.recorder_restart_backoff_seconds)
+                snap_name = session_account_name(session_snapshot, account.name)
                 process = start_recorder(
-                    settings, room_dir, account.name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    settings, room_dir, snap_name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
                     record_url,
                 )
                 process_started_at = time.time()
             elif live and active and process is None and not (session_snapshot or {}).get("ended_ms"):
-                snap_name = (session_snapshot or {}).get("account_name", account.name)
+                snap_name = session_account_name(session_snapshot, account.name)
                 process = start_recorder(settings, room_dir, snap_name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"), record_url)
                 process_started_at = time.time()
             if active and offline_checks >= settings.offline_confirmations:
                 stop_recorder(process)
-                snap_name = (session_snapshot or {}).get("account_name", account.name)
+                snap_name = session_account_name(session_snapshot, account.name)
                 snap_recipients = (session_snapshot or {}).get("recipients", account.recipients)
                 record_id = (session_snapshot or {}).get("record_id", "")
                 started_ms = (session_snapshot or {}).get("started_ms", int(time.time() * 1000))

@@ -36,15 +36,35 @@ recording_active() {
   pgrep -af '[f]fmpeg' | grep -F -- '-f segment' | grep -Fq 'recordings/'
 }
 
-session_active() {
+live_session_active() {
   /opt/douyin-live-monitor/.venv/bin/python - "$STATE_DB" <<'PY'
 import sqlite3
 import sys
 
 conn = sqlite3.connect(sys.argv[1])
-row = conn.execute("SELECT EXISTS(SELECT 1 FROM sessions WHERE active=1)").fetchone()
+row = conn.execute(
+    "SELECT EXISTS(SELECT 1 FROM sessions WHERE active=1 AND COALESCE(ended_ms, 0)=0)"
+).fetchone()
 raise SystemExit(0 if row and row[0] else 1)
 PY
+}
+
+recent_minutes_submission() {
+  /opt/douyin-live-monitor/.venv/bin/python - "$STATE_DB" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+row = conn.execute(
+    "SELECT EXISTS(SELECT 1 FROM minutes_submissions "
+    "WHERE status='submitting' AND updated_at > datetime('now', '-15 minutes'))"
+).fetchone()
+raise SystemExit(0 if row and row[0] else 1)
+PY
+}
+
+recent_upload_checkpoint() {
+  find "$APP_DIR" -type f -name '*.feishu-upload.json' -mmin -15 -print -quit | grep -q .
 }
 
 recovery_active() {
@@ -52,7 +72,7 @@ recovery_active() {
 }
 
 processing_active() {
-  pgrep -x ffmpeg >/dev/null || recovery_active || session_active
+  pgrep -x ffmpeg >/dev/null || recovery_active || live_session_active || recent_minutes_submission || recent_upload_checkpoint
 }
 
 while true; do

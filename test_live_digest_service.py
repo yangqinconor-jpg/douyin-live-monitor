@@ -10,7 +10,7 @@ from live_digest_service import (
     create_live_record, drive_file_url, ensure_merge_space, find_minutes_documents, message_url,
     RecordingIntegrityError, VideoMetadata, recording_complete_message, recording_complete_post,
     recording_integrity_result, send_post, session_segments, sync_accounts, upload_drive_file,
-    inferred_recording_end_ms,
+    inferred_recording_end_ms, session_account_name,
     stable_file_sizes, verify_drive_file_size, video_is_readable, start_recorder, recorder_is_stalled,
 )
 
@@ -410,6 +410,24 @@ class FeishuConfigTest(unittest.TestCase):
                     process, folder, "账号", "20260826_100012", 900,
                     stall_seconds=180, startup_grace_seconds=120,
                 ))
+
+    def test_recorder_restarts_keep_the_session_name_snapshot(self):
+        self.assertEqual(
+            session_account_name({"account_name": "直播开始时的名称"}, "现在的名称"),
+            "直播开始时的名称",
+        )
+        self.assertEqual(session_account_name(None, "当前名称"), "当前名称")
+
+    def test_stale_minutes_submission_can_be_reclaimed_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = DeliveryLedger(Path(directory) / "state.sqlite3")
+            ledger.save_session_artifacts("session", minutes_url="")
+            ledger.db.execute(
+                "UPDATE minutes_submissions SET status='submitting', updated_at=datetime('now', '-11 minutes') "
+                "WHERE session_id='session'"
+            )
+            ledger.db.commit()
+            self.assertEqual(ledger.claim_minutes_submission("session"), (True, ""))
 
     @patch("live_digest_service.bitable_request")
     def test_new_live_record_uses_current_status_fields(self, request):
