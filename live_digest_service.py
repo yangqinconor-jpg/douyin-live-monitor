@@ -1278,6 +1278,13 @@ def session_segments(room_dir: Path, account_name: str, session_id: str) -> list
             and segment.stem.rsplit("_", 1)[-1].isdigit()]
 
 
+def inferred_recording_end_ms(segments: list[Path]) -> int | None:
+    """Use the newest completed segment as a recovery end-time hint."""
+    if not segments:
+        return None
+    return int(max(segment.stat().st_mtime for segment in segments) * 1000)
+
+
 def run_room(settings: Settings, account_id: str, registry: dict[str, Account], registry_lock: threading.Lock, ledger: DeliveryLedger) -> None:
     room_dir = settings.output_dir / account_id
     room_dir.mkdir(parents=True, exist_ok=True)
@@ -1342,12 +1349,13 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 snap_recipients = (session_snapshot or {}).get("recipients", account.recipients)
                 record_id = (session_snapshot or {}).get("record_id", "")
                 started_ms = (session_snapshot or {}).get("started_ms", int(time.time() * 1000))
+                segments = session_segments(room_dir, snap_name, session_stamp or "unknown")
                 # Record the stream end before any merge/upload/transcription
                 # work. A retry may run hours later, but must keep this value.
-                ended_ms = ledger.record_session_end(account_id, int(time.time() * 1000))
+                end_hint = (session_snapshot or {}).get("ended_ms") or inferred_recording_end_ms(segments)
+                ended_ms = ledger.record_session_end(account_id, int(end_hint or time.time() * 1000))
                 if session_snapshot is not None:
                     session_snapshot["ended_ms"] = ended_ms
-                segments = session_segments(room_dir, snap_name, session_stamp or "unknown")
                 if settings.transcription_mode == "local_pull":
                     manifest = room_dir / f"{session_stamp}_pending_transcription.json"
                     manifest.write_text(json.dumps({

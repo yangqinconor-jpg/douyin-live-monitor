@@ -10,6 +10,7 @@ from live_digest_service import (
     create_live_record, drive_file_url, ensure_merge_space, find_minutes_documents, message_url,
     RecordingIntegrityError, VideoMetadata, recording_complete_message, recording_complete_post,
     recording_integrity_result, send_post, session_segments, sync_accounts, upload_drive_file,
+    inferred_recording_end_ms,
     stable_file_sizes, verify_drive_file_size, video_is_readable,
 )
 
@@ -137,6 +138,15 @@ class DeliveryLedgerTest(unittest.TestCase):
 
 
 class FeishuConfigTest(unittest.TestCase):
+    def test_inferred_recording_end_uses_latest_segment_mtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.mp4"
+            second = Path(directory) / "second.mp4"
+            first.touch()
+            second.touch()
+            second_timestamp = second.stat().st_mtime
+            self.assertEqual(inferred_recording_end_ms([first, second]), int(second_timestamp * 1000))
+
     def test_account_table_is_the_runtime_configuration_source(self):
         settings = Settings(Path("."), Path("."), "", bitable_app_token="app", account_table_id="accounts")
         response = {"data": {"items": [{"record_id": "rec", "fields": {
