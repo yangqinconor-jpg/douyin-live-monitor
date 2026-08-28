@@ -8,7 +8,7 @@
 
 ## 功能
 
-- 同时监控多个抖音直播间，默认每 60 秒轮询一次。
+- 同时监控多个抖音直播间，默认每 120 秒轮询一次。
 - 检测到开播后，立即向多个飞书用户或群聊发送通知。
 - FFmpeg 按固定时长分段录制，默认每段 15 分钟。
 - 临时录制使用 MPEG-TS 分段，断流或进程异常退出时仍可读取；最终归档仍合并为 MP4。
@@ -167,7 +167,7 @@ cp live_digest.json.example live_digest.json
 | `feishu_chat_id` | 可选的群聊 ID | `oc_xxx` |
 | `feishu_user_token_path` | 管理员飞书用户授权令牌的私密路径 | `/etc/douyin-live-monitor/feishu_user_tokens.json` |
 | `drive_root_folder_token` | “直播监控台”文件夹 token | 飞书云盘文件夹 token |
-| `minutes_poll_seconds` | 妙记转写结果轮询间隔 | `60` |
+| `minutes_poll_seconds` | 妙记转写结果轮询间隔 | `60`（妙记任务独立轮询） |
 | `recorder_stall_seconds` | 分片无更新多久后重拉流 | `180` |
 | `recorder_startup_grace_seconds` | 启动后等待首个分片的宽限时间 | `120` |
 | `recorder_restart_backoff_seconds` | 录制器重启前等待秒数 | `5` |
@@ -187,7 +187,7 @@ cp live_digest.json.example live_digest.json
 ### 现在如何通过表格调整配置
 
 1. 在飞书多维表格的“监控账号列表”新增或修改账号名称、抖音号、监控开关和监控接收人。
-2. 服务每 60 秒自动同步，无需手动改 `rooms` 或接收人列表，也无需重启服务。
+2. 服务每 120 秒自动同步，无需手动改 `rooms` 或接收人列表，也无需重启服务。
 3. 只有修改 App Token、数据表 ID 或其他基础配置时，才需要重启服务：
 
 ```bash

@@ -15,14 +15,14 @@
   "whisper_model": "small",
   "whisper_language": "zh",
   "transcription_mode": "feishu_minutes",
-  "poll_seconds": 60,
+  "poll_seconds": 120,
   "segment_seconds": 900,
   "proxy": "",
   "douyin_cookie": ""
   ,"bitable_app_token": ""
   ,"account_table_id": ""
   ,"record_table_id": ""
-  ,"config_poll_seconds": 60
+  ,"config_poll_seconds": 120
   ,"state_db": "./monitor_state.sqlite3"
   ,"feishu_user_token_path": "/etc/douyin-live-monitor/feishu_user_tokens.json"
   ,"drive_root_folder_token": ""

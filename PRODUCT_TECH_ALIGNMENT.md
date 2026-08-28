@@ -43,7 +43,7 @@
 
 | 需求 | 当前实现 | 状态 |
 | --- | --- | --- |
-| 60 秒轮询直播状态 | 云端 `live_digest_service.py` 的 `poll_seconds=60` | 已实现 |
+| 120 秒轮询直播状态 | 云端 `live_digest_service.py` 的 `poll_seconds=120` | 已实现 |
 | 两个抖音号并行监控 | 每个 URL 一个线程 | 已实现 |
 | 开播通知 | 检测到 `is_live` 后调用飞书应用消息接口 | 已实现，缺少持久化幂等 |
 | MP4 分段录制 | FFmpeg segment muxer，默认 900 秒 | 已实现 |

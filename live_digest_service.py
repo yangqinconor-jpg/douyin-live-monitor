@@ -33,7 +33,7 @@ class Settings:
     chat_id: str = ""
     recipient_open_ids: list[str] | None = None
     recipients: list[dict[str, str]] | None = None
-    poll_seconds: int = 60
+    poll_seconds: int = 120
     segment_seconds: int = 900
     whisper_model: str = "small"
     whisper_language: str = "zh"
@@ -43,7 +43,7 @@ class Settings:
     bitable_app_token: str = ""
     account_table_id: str = ""
     record_table_id: str = ""
-    config_poll_seconds: int = 60
+    config_poll_seconds: int = 120
     state_db: str = "./monitor_state.sqlite3"
     feishu_user_token_path: str = ""
     drive_root_folder_token: str = ""
@@ -1656,14 +1656,14 @@ def main() -> None:
                         app_secret=cfg.get("feishu_app_secret", ""), chat_id=cfg.get("feishu_chat_id", ""),
                         recipient_open_ids=cfg.get("feishu_open_ids", []),
                         recipients=cfg.get("feishu_recipients", []),
-                        poll_seconds=int(cfg.get("poll_seconds", 60)),
+                        poll_seconds=int(cfg.get("poll_seconds", 120)),
                         segment_seconds=int(cfg.get("segment_seconds", 900)),
                         whisper_model=cfg.get("whisper_model", "small"),
                         whisper_language=cfg.get("whisper_language", "zh"), proxy=cfg.get("proxy", ""),
                         transcription_mode=cfg.get("transcription_mode", "server"),
                         cookie=cfg.get("douyin_cookie", ""), bitable_app_token=cfg.get("bitable_app_token", ""),
                         account_table_id=cfg.get("account_table_id", ""), record_table_id=cfg.get("record_table_id", ""),
-                        config_poll_seconds=int(cfg.get("config_poll_seconds", 60)), state_db=cfg.get("state_db", "./monitor_state.sqlite3"),
+                        config_poll_seconds=int(cfg.get("config_poll_seconds", 120)), state_db=cfg.get("state_db", "./monitor_state.sqlite3"),
                         feishu_user_token_path=cfg.get("feishu_user_token_path", ""),
                         drive_root_folder_token=cfg.get("drive_root_folder_token", ""),
                         drive_platform_folder_name=cfg.get("drive_platform_folder_name", "抖音"),
