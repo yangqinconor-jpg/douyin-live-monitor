@@ -60,6 +60,45 @@ class DeliveryLedgerTest(unittest.TestCase):
             ledger.end_session("account")
             self.assertIsNone(ledger.active_session("account"))
 
+    def test_session_end_time_is_persisted_and_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = DeliveryLedger(Path(directory) / "state.sqlite3")
+            ledger.start_session("account", "session", "名称", [], "record", 1_000)
+            self.assertEqual(ledger.record_session_end("account", 10_000), 10_000)
+            self.assertEqual(ledger.record_session_end("account", 99_000), 10_000)
+            self.assertEqual(ledger.active_session("account")["ended_ms"], 10_000)
+
+    def test_recorder_stop_is_used_when_stream_end_is_confirmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = DeliveryLedger(Path(directory) / "state.sqlite3")
+            ledger.start_session("account", "session", "名称", [], "record", 1_000)
+            ledger.record_recorder_stop("account", 20_000)
+            self.assertEqual(ledger.record_session_end("account", 90_000), 20_000)
+            self.assertEqual(ledger.active_session("account")["ended_ms"], 20_000)
+            ledger.start_session("account", "next", "名称", [], "record", 100_000)
+            ledger.record_recorder_stop("account", 110_000)
+            ledger.clear_recorder_stop("account")
+            self.assertEqual(ledger.record_session_end("account", 120_000), 120_000)
+
+    def test_old_sessions_database_is_migrated_with_end_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE sessions (account_id TEXT PRIMARY KEY, session_id TEXT, "
+                "account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO sessions VALUES(?,?,?,?,?,?,?)",
+                ("account", "session", "名称", "[]", "record", 1_000, 1),
+            )
+            connection.commit()
+            connection.close()
+
+            ledger = DeliveryLedger(path)
+            self.assertEqual(ledger.record_session_end("account", 10_000), 10_000)
+            self.assertEqual(ledger.active_session("account")["ended_ms"], 10_000)
+
     def test_artifact_checkpoint_survives_a_notification_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = DeliveryLedger(Path(directory) / "state.sqlite3")

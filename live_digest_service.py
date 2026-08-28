@@ -91,7 +91,12 @@ class DeliveryLedger:
         self.lock = threading.Lock()
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS deliveries (session_id TEXT, recipient_id TEXT, message_type TEXT, status TEXT, message_id TEXT, error TEXT, updated_at TEXT, PRIMARY KEY(session_id, recipient_id, message_type))")
-            self.db.execute("CREATE TABLE IF NOT EXISTS sessions (account_id TEXT PRIMARY KEY, session_id TEXT, account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS sessions (account_id TEXT PRIMARY KEY, session_id TEXT, account_name TEXT, recipients TEXT, record_id TEXT, started_ms INTEGER, active INTEGER, ended_ms INTEGER, recording_end_ms INTEGER)")
+            session_columns = {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}
+            if "ended_ms" not in session_columns:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN ended_ms INTEGER")
+            if "recording_end_ms" not in session_columns:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN recording_end_ms INTEGER")
             self.db.execute("CREATE TABLE IF NOT EXISTS session_artifacts (session_id TEXT PRIMARY KEY, archive_video_url TEXT, archive_video_size INTEGER, minutes_url TEXT, transcript_url TEXT, summary_url TEXT, video_name TEXT, minutes_title TEXT, minutes_created_at INTEGER, recording_status TEXT, integrity_note TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS minutes_submissions (session_id TEXT PRIMARY KEY, status TEXT, minutes_url TEXT, error TEXT, updated_at TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
@@ -184,17 +189,17 @@ class DeliveryLedger:
 
     def active_session(self, account_id: str) -> dict[str, Any] | None:
         with self.lock:
-            row = self.db.execute("SELECT session_id, account_name, recipients, record_id, started_ms FROM sessions WHERE account_id=? AND active=1", (account_id,)).fetchone()
+            row = self.db.execute("SELECT session_id, account_name, recipients, record_id, started_ms, ended_ms, recording_end_ms FROM sessions WHERE account_id=? AND active=1", (account_id,)).fetchone()
         if not row:
             return None
-        return {"session_id": row[0], "account_name": row[1], "recipients": json.loads(row[2]), "record_id": row[3], "started_ms": row[4]}
+        return {"session_id": row[0], "account_name": row[1], "recipients": json.loads(row[2]), "record_id": row[3], "started_ms": row[4], "ended_ms": row[5], "recording_end_ms": row[6]}
 
     def start_session(self, account_id: str, session_id: str, account_name: str, recipients: list[dict[str, str]], record_id: str, started_ms: int) -> bool:
         with self.lock, self.db:
             blocked = self.db.execute("SELECT value FROM service_flags WHERE key='deployment_pending'").fetchone()
             if blocked and blocked[0] == "1":
                 return False
-            self.db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,1) ON CONFLICT(account_id) DO UPDATE SET session_id=excluded.session_id, account_name=excluded.account_name, recipients=excluded.recipients, record_id=excluded.record_id, started_ms=excluded.started_ms, active=1", (account_id, session_id, account_name, json.dumps(recipients, ensure_ascii=False), record_id, started_ms))
+            self.db.execute("INSERT INTO sessions(account_id,session_id,account_name,recipients,record_id,started_ms,active,ended_ms,recording_end_ms) VALUES(?,?,?,?,?,?,1,NULL,NULL) ON CONFLICT(account_id) DO UPDATE SET session_id=excluded.session_id, account_name=excluded.account_name, recipients=excluded.recipients, record_id=excluded.record_id, started_ms=excluded.started_ms, active=1, ended_ms=NULL, recording_end_ms=NULL", (account_id, session_id, account_name, json.dumps(recipients, ensure_ascii=False), record_id, started_ms))
             return True
 
     def set_session_record_id(self, account_id: str, record_id: str) -> None:
@@ -208,6 +213,36 @@ class DeliveryLedger:
     def end_session(self, account_id: str) -> None:
         with self.lock, self.db:
             self.db.execute("UPDATE sessions SET active=0 WHERE account_id=?", (account_id,))
+
+    def record_session_end(self, account_id: str, ended_ms: int) -> int:
+        """Persist the first observed end time; retries must reuse it."""
+        with self.lock, self.db:
+            row = self.db.execute(
+                "SELECT ended_ms, recording_end_ms FROM sessions WHERE account_id=? AND active=1", (account_id,),
+            ).fetchone()
+            if row and row[0]:
+                return int(row[0])
+            final_end = int(row[1] or ended_ms) if row else ended_ms
+            self.db.execute(
+                "UPDATE sessions SET ended_ms=? WHERE account_id=? AND active=1 AND ended_ms IS NULL",
+                (final_end, account_id),
+            )
+            return final_end
+
+    def record_recorder_stop(self, account_id: str, stopped_ms: int) -> None:
+        """Remember the latest recorder exit without ending the live session."""
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE sessions SET recording_end_ms=? WHERE account_id=? AND active=1 AND ended_ms IS NULL",
+                (stopped_ms, account_id),
+            )
+
+    def clear_recorder_stop(self, account_id: str) -> None:
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE sessions SET recording_end_ms=NULL WHERE account_id=? AND active=1 AND ended_ms IS NULL",
+                (account_id,),
+            )
 
     def session_artifacts(self, session_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -806,7 +841,10 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
                 time.sleep(min(30, 2 ** attempt))
 
     pending_parts = [sequence for sequence in range(block_num) if sequence not in completed_parts]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(pending_parts) or 1)) as executor:
+    # A large recording is split into thousands of parts; a small bounded
+    # worker pool keeps uploads moving without creating an unbounded request
+    # burst against Feishu.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(pending_parts) or 1)) as executor:
         list(executor.map(upload_part, pending_parts))
     current_stat = path.stat()
     if (
@@ -1265,6 +1303,11 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 continue
             info = stream_info(settings, url)
             live = bool(info.get("is_live") and info.get("record_url"))
+            if live and active and process and process.poll() is None:
+                # A restarted recorder has survived one polling interval, so
+                # a previous process exit was transient rather than the end
+                # of the stream.
+                ledger.clear_recorder_stop(account_id)
             if live and not active:
                 active = True
                 session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1276,18 +1319,19 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 process = start_recorder(settings, room_dir, account.name, session_stamp, info["record_url"])
                 record_id = create_live_record(settings, account, session_stamp, info.get("title", ""), started_ms, account.recipients)
                 ledger.set_session_record_id(account_id, record_id)
-                session_snapshot = {"account_name": account.name, "recipients": account.recipients, "record_id": record_id, "started_ms": started_ms}
+                session_snapshot = {"account_name": account.name, "recipients": account.recipients, "record_id": record_id, "started_ms": started_ms, "ended_ms": None}
                 update_account_state(settings, account, status="正常使用", started=started_ms)
                 send_text(settings, f"【开播】{account.name}\n{info.get('title', '')}\n{url}", recipients=account.recipients, session_id=session_stamp, message_type="live_start", ledger=ledger)
                 print(f"Live started: {url} ({session_stamp})", flush=True)
-            elif live and active and process and process.poll() is not None:
+            elif live and active and process and process.poll() is not None and not (session_snapshot or {}).get("ended_ms"):
                 exit_code = process.returncode
+                ledger.record_recorder_stop(account_id, int(time.time() * 1000))
                 process = start_recorder(
                     settings, room_dir, account.name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
                     info["record_url"],
                 )
                 print(f"Recorder restarted: {url}; previous exit code {exit_code}", flush=True)
-            elif live and active and process is None:
+            elif live and active and process is None and not (session_snapshot or {}).get("ended_ms"):
                 snap_name = (session_snapshot or {}).get("account_name", account.name)
                 process = start_recorder(settings, room_dir, snap_name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"), info["record_url"])
             if active and not live:
@@ -1298,6 +1342,11 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 snap_recipients = (session_snapshot or {}).get("recipients", account.recipients)
                 record_id = (session_snapshot or {}).get("record_id", "")
                 started_ms = (session_snapshot or {}).get("started_ms", int(time.time() * 1000))
+                # Record the stream end before any merge/upload/transcription
+                # work. A retry may run hours later, but must keep this value.
+                ended_ms = ledger.record_session_end(account_id, int(time.time() * 1000))
+                if session_snapshot is not None:
+                    session_snapshot["ended_ms"] = ended_ms
                 segments = session_segments(room_dir, snap_name, session_stamp or "unknown")
                 if settings.transcription_mode == "local_pull":
                     manifest = room_dir / f"{session_stamp}_pending_transcription.json"
@@ -1313,7 +1362,6 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                         "segments": [segment.name for segment in segments],
                         "created_at": datetime.now().isoformat(timespec="seconds"),
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
-                    ended_ms = int(time.time() * 1000)
                     update_live_record(settings, record_id, {"直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}", "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)), "录制状态": "已完成" if segments else "录制失败", "转写状态": "待转写" if segments else "转写失败", "完成提醒状态": "待发送" if segments else "无需发送"})
                     ledger.end_session(account_id)
                     update_account_state(settings, account, status="正常使用", ended=ended_ms)
@@ -1322,7 +1370,6 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     time.sleep(settings.poll_seconds)
                     continue
                 if settings.transcription_mode == "feishu_minutes":
-                    ended_ms = int(time.time() * 1000)
                     update_live_record(settings, record_id, {
                         "直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}",
                         "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)),
