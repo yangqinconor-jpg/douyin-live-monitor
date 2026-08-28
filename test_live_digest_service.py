@@ -136,6 +136,16 @@ class DeliveryLedgerTest(unittest.TestCase):
                 (False, "https://tenant/minutes/token"),
             )
 
+    def test_account_monitor_count_is_seeded_and_incremented_durably(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            first = DeliveryLedger(path)
+            self.assertEqual(first.account_count("account", 3), 3)
+            self.assertEqual(first.increment_account_count("account", 0), 4)
+            second = DeliveryLedger(path)
+            self.assertEqual(second.account_count("account", 1), 4)
+            self.assertEqual(second.increment_account_count("account", 1), 5)
+
 
 class FeishuConfigTest(unittest.TestCase):
     def test_inferred_recording_end_uses_latest_segment_mtime(self):
@@ -153,12 +163,14 @@ class FeishuConfigTest(unittest.TestCase):
             "监控账号": "账号名称", "抖音号": "douyin-id", "监控开关": "启用",
             "直播间链接": {"link": "https://live.douyin.com/douyin-id"},
             "监控接收人": [{"id": "ou_1", "name": "接收人"}],
+            "监控场次": 7,
         }}]}}
         with patch("live_digest_service.bitable_request", return_value=response):
             account = sync_accounts(settings)[0]
         self.assertTrue(account.enabled)
         self.assertEqual(account.name, "账号名称")
         self.assertEqual(account.recipients[0]["id"], "ou_1")
+        self.assertEqual(account.monitor_count, 7)
 
     def test_names_are_used_in_artifact_paths(self):
         path = artifact_path(Path("."), "直播逐字稿", "账号名称", "20260825_080020", ".txt")

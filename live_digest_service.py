@@ -64,6 +64,7 @@ class Account:
     enabled: bool
     recipients: list[dict[str, str]]
     table_record_id: str = ""
+    monitor_count: int = 0
 
 
 class CompletionNotificationError(RuntimeError):
@@ -103,6 +104,7 @@ class DeliveryLedger:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN recording_end_ms INTEGER")
             self.db.execute("CREATE TABLE IF NOT EXISTS session_artifacts (session_id TEXT PRIMARY KEY, archive_video_url TEXT, archive_video_size INTEGER, minutes_url TEXT, transcript_url TEXT, summary_url TEXT, video_name TEXT, minutes_title TEXT, minutes_created_at INTEGER, recording_status TEXT, integrity_note TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS minutes_submissions (session_id TEXT PRIMARY KEY, status TEXT, minutes_url TEXT, error TEXT, updated_at TEXT)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS account_counters (account_id TEXT PRIMARY KEY, monitor_count INTEGER NOT NULL DEFAULT 0)")
             self.db.execute("CREATE TABLE IF NOT EXISTS service_flags (key TEXT PRIMARY KEY, value TEXT)")
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(session_artifacts)")}
             for name, definition in {
@@ -194,6 +196,36 @@ class DeliveryLedger:
                 "WHERE session_id=?",
                 (status, minutes_url, error, session_id),
             )
+
+    def account_count(self, account_id: str, initial: int = 0) -> int:
+        """Return a durable count, seeding it from the Bitable value once."""
+        initial = max(0, int(initial or 0))
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO account_counters(account_id, monitor_count) VALUES(?, ?) "
+                "ON CONFLICT(account_id) DO UPDATE SET monitor_count=MAX(account_counters.monitor_count, excluded.monitor_count)",
+                (account_id, initial),
+            )
+            row = self.db.execute(
+                "SELECT monitor_count FROM account_counters WHERE account_id=?", (account_id,),
+            ).fetchone()
+        return int(row[0] if row else initial)
+
+    def increment_account_count(self, account_id: str, initial: int = 0) -> int:
+        """Increment exactly once for a newly-created monitoring session."""
+        initial = max(0, int(initial or 0))
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO account_counters(account_id, monitor_count) VALUES(?, ?) "
+                "ON CONFLICT(account_id) DO NOTHING", (account_id, initial),
+            )
+            self.db.execute(
+                "UPDATE account_counters SET monitor_count=monitor_count+1 WHERE account_id=?", (account_id,),
+            )
+            row = self.db.execute(
+                "SELECT monitor_count FROM account_counters WHERE account_id=?", (account_id,),
+            ).fetchone()
+        return int(row[0] if row else initial + 1)
 
     def active_session(self, account_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -496,12 +528,22 @@ def sync_accounts(settings: Settings) -> list[Account]:
         url = str(url_value or f"https://live.douyin.com/{account_id}")
         users = fields.get("监控接收人") or []
         recipients = [{"name": u.get("name", ""), "id_type": "open_id", "id": u.get("id", "")} for u in users if u.get("id")]
-        accounts.append(Account(account_id, str(fields.get("监控账号", account_id)), url, enabled, recipients, item.get("record_id", item.get("id", ""))))
+        raw_count = fields.get("监控场次", 0)
+        try:
+            monitor_count = max(0, int(float(raw_count or 0)))
+        except (TypeError, ValueError):
+            monitor_count = 0
+        accounts.append(Account(
+            account_id, str(fields.get("监控账号", account_id)), url, enabled, recipients,
+            item.get("record_id", item.get("id", "")), monitor_count,
+        ))
     return accounts
 
 
-def update_account_state(settings: Settings, account: Account, *, status: str, started: int | None = None, ended: int | None = None, error: str | None = None) -> None:
+def update_account_state(settings: Settings, account: Account, *, status: str, started: int | None = None, ended: int | None = None, error: str | None = None, monitor_count: int | None = None) -> None:
     fields: dict[str, Any] = {"服务状态": status, "最后同步时间": int(time.time() * 1000)}
+    if monitor_count is not None:
+        fields["监控场次"] = max(0, int(monitor_count))
     if started:
         fields["最后开播时间"] = started
     if ended:
@@ -1445,8 +1487,10 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 process_started_at = time.time()
                 record_id = create_live_record(settings, account, session_stamp, info.get("title", ""), started_ms, account.recipients)
                 ledger.set_session_record_id(account_id, record_id)
+                monitor_count = ledger.increment_account_count(account_id, account.monitor_count)
+                account.monitor_count = monitor_count
                 session_snapshot = {"account_name": account.name, "recipients": account.recipients, "record_id": record_id, "started_ms": started_ms, "ended_ms": None}
-                update_account_state(settings, account, status="正常使用", started=started_ms)
+                update_account_state(settings, account, status="正常使用", started=started_ms, monitor_count=monitor_count)
                 send_text(settings, f"【开播】{account.name}\n{info.get('title', '')}\n{url}", recipients=account.recipients, session_id=session_stamp, message_type="live_start", ledger=ledger)
                 print(f"Live started: {url} ({session_stamp})", flush=True)
             elif live and active and process and process.poll() is not None and not (session_snapshot or {}).get("ended_ms"):
@@ -1510,7 +1554,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                             "完成提醒状态": "无需发送", "失败原因": integrity_note or "下播后没有可读取的录像分段",
                         })
                         ledger.end_session(account_id)
-                        update_account_state(settings, account, status="正常使用", ended=ended_ms)
+                        update_account_state(settings, account, status="正常使用", ended=ended_ms, monitor_count=account.monitor_count)
                         active, process, session_stamp, session_snapshot = False, None, None, None
                         process_started_at = 0.0
                         offline_checks = 0
@@ -1535,7 +1579,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
                     update_live_record(settings, record_id, {"直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}", "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)), "录制状态": recording_status if segments else "录制失败", "转写状态": "待转写" if valid_segments else "转写失败", "完成提醒状态": "待发送" if valid_segments else "无需发送", "失败原因": integrity_note})
                     ledger.end_session(account_id)
-                    update_account_state(settings, account, status="正常使用", ended=ended_ms)
+                    update_account_state(settings, account, status="正常使用", ended=ended_ms, monitor_count=account.monitor_count)
                     print(f"Local transcription queued: {manifest}", flush=True)
                     active, process, session_stamp = False, None, None
                     process_started_at = 0.0
@@ -1571,7 +1615,7 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                             })
                             raise
                     ledger.end_session(account_id)
-                    update_account_state(settings, account, status="正常使用", ended=ended_ms)
+                    update_account_state(settings, account, status="正常使用", ended=ended_ms, monitor_count=account.monitor_count)
                     print(f"Feishu Minutes processing finished: {url}; {len(segments)} segments", flush=True)
                     active, process, session_stamp, session_snapshot = False, None, None, None
                     process_started_at = 0.0
@@ -1650,6 +1694,8 @@ def main() -> None:
             if settings.bitable_app_token and settings.account_table_id:
                 try:
                     accounts = sync_accounts(settings)
+                    for account in accounts:
+                        account.monitor_count = ledger.account_count(account.account_id, account.monitor_count)
                     with registry_lock:
                         registry.clear()
                         registry.update({a.account_id: a for a in accounts})
@@ -1659,6 +1705,7 @@ def main() -> None:
                         update_account_state(
                             settings, account,
                             status="正常使用" if account.enabled else "未使用",
+                            monitor_count=account.monitor_count,
                         )
                 except Exception as exc:
                     print(f"Account config sync failed: {exc}", flush=True)
