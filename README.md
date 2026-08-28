@@ -156,6 +156,8 @@ cp live_digest.json.example live_digest.json
 | `recorder_root` | DouyinLiveRecorder 绝对路径 | `/opt/douyin-live-monitor/DouyinLiveRecorder` |
 | `output_dir` | 录播和逐字稿输出目录 | `./recordings` |
 | `rooms` | 要监控的抖音直播间 URL 数组 | `https://live.douyin.com/...` |
+| `poll_seconds` | 直播状态轮询间隔 | `120` |
+| `config_poll_seconds` | 飞书监控账号列表同步间隔 | `120` |
 | `segment_seconds` | 录制分段时长 | `900` |
 | `whisper_model` | Whisper 模型 | `small` |
 | `whisper_language` | 转写语言 | `zh` |
