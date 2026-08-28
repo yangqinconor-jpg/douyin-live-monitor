@@ -29,4 +29,8 @@
   ,"drive_platform_folder_name": "抖音"
   ,"minutes_poll_seconds": 60
   ,"minutes_timeout_seconds": 7200
+  ,"recorder_stall_seconds": 180
+  ,"recorder_startup_grace_seconds": 120
+  ,"recorder_restart_backoff_seconds": 5
+  ,"offline_confirmations": 3
 }

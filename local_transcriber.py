@@ -128,31 +128,42 @@ def process_manifest(config: dict[str, Any], config_dir: Path, manifest_path: st
     account_id = manifest.get("account_id", Path(manifest_path).parent.name)
     account_name = manifest.get("account_name", account_id)
     recipients = manifest.get("recipient_snapshot") or settings.recipients or []
+    recording_status = str(manifest.get("recording_status") or "已完成")
+    integrity_note = str(manifest.get("integrity_note") or "")
     full_path = artifact_path(session_dir, "直播逐字稿", account_name, manifest["session_id"], ".txt")
     full_path.write_text(full, encoding="utf-8")
     first_segment = segments[0]
+    if recording_status != "已完成":
+        update_live_record(settings, manifest.get("record_id", ""), {
+            "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "无需发送",
+            "失败原因": integrity_note,
+        })
+        published_marker.write_text(
+            json.dumps({"session_id": manifest.get("session_id"), "published_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "transcript": str(full_path)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        done_path = f"{manifest_path}.done"
+        run([*ssh_args(server, key), f"sudo mv {shlex.quote(manifest_path)} {shlex.quote(done_path)}"], timeout=60)
+        print(f"Completed partial local transcription without notification: {full_path}", flush=True)
+        return
     update_live_record(settings, manifest.get("record_id", ""), {
-        "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送中",
+        "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "发送中",
     })
     try:
         publish_finished_session(
             settings, account_name=account_name, session_id=manifest["session_id"],
-            video_url=str(first_segment), transcript_url=str(full_path), minute_url="",
-            video_name=first_segment.name, transcript_name=full_path.name,
+            minutes_url=str(first_segment), transcript_url=str(full_path), summary_url="",
             recipients=recipients, ledger=ledger,
         )
     except Exception as exc:
         update_live_record(settings, manifest.get("record_id", ""), {
-            "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "发送失败",
+            "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "发送失败",
             "失败原因": str(exc)[:1000],
         })
         raise
-    attach_session_artifacts(
-        settings, manifest.get("record_id", ""),
-        artifact_path(session_dir, "直播截图", account_name, manifest["session_id"], ".jpg"),
-    )
+    attach_session_artifacts(settings, manifest.get("record_id", ""), transcript_url=str(full_path))
     update_live_record(settings, manifest.get("record_id", ""), {
-        "录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "已发送",
+        "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "已发送",
         "完成提醒时间": int(time.time() * 1000), "失败原因": "",
     })
     published_marker.write_text(

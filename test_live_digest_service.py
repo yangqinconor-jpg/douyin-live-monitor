@@ -11,7 +11,7 @@ from live_digest_service import (
     RecordingIntegrityError, VideoMetadata, recording_complete_message, recording_complete_post,
     recording_integrity_result, send_post, session_segments, sync_accounts, upload_drive_file,
     inferred_recording_end_ms,
-    stable_file_sizes, verify_drive_file_size, video_is_readable,
+    stable_file_sizes, verify_drive_file_size, video_is_readable, start_recorder, recorder_is_stalled,
 )
 
 
@@ -375,6 +375,41 @@ class FeishuConfigTest(unittest.TestCase):
             segment.write_bytes(b"x" * 1024)
             final.write_bytes(b"x" * 1024)
             self.assertEqual(session_segments(folder, "示例账号", "20260826_100012"), [segment])
+
+    @patch("live_digest_service.subprocess.Popen")
+    def test_recorder_uses_interrupt_resilient_ts_segments_and_reconnect(self, popen):
+        popen.return_value = unittest.mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            start_recorder(
+                Settings(Path("."), Path(directory), ""), Path(directory),
+                "示例账号", "20260826_100012", "https://cdn.example/live.m3u8",
+            )
+        command = popen.call_args.args[0]
+        self.assertIn("-reconnect_on_http_error", command)
+        self.assertIn("404,500,502,503,504", command)
+        self.assertIn("-segment_format", command)
+        self.assertEqual(command[command.index("-segment_format") + 1], "mpegts")
+        self.assertTrue(command[-1].endswith("_%03d.ts"))
+
+    def test_recorder_stall_detection_uses_latest_segment_mtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            segment = folder / "直播视频-账号-2026-08-26_10-00-12_000.ts"
+            segment.write_bytes(b"x" * 2048)
+            process = unittest.mock.Mock()
+            process.poll.return_value = None
+            import os
+            os.utime(segment, (900, 900))
+            with patch("live_digest_service.time.time", return_value=1000):
+                self.assertFalse(recorder_is_stalled(
+                    process, folder, "账号", "20260826_100012", 900,
+                    stall_seconds=180, startup_grace_seconds=120,
+                ))
+                os.utime(segment, (700, 700))
+                self.assertTrue(recorder_is_stalled(
+                    process, folder, "账号", "20260826_100012", 900,
+                    stall_seconds=180, startup_grace_seconds=120,
+                ))
 
     @patch("live_digest_service.bitable_request")
     def test_new_live_record_uses_current_status_fields(self, request):

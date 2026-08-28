@@ -50,6 +50,10 @@ class Settings:
     drive_platform_folder_name: str = "抖音"
     minutes_poll_seconds: int = 60
     minutes_timeout_seconds: int = 7200
+    recorder_stall_seconds: int = 180
+    recorder_startup_grace_seconds: int = 120
+    recorder_restart_backoff_seconds: int = 5
+    offline_confirmations: int = 3
 
 
 @dataclass
@@ -1202,6 +1206,15 @@ def complete_with_feishu_minutes(
         "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "发送中",
         "失败原因": integrity_note,
     })
+    # A damaged or incomplete recording can still be archived and made
+    # available for inspection, but it must never generate a misleading
+    # "recording complete" notification.
+    if recording_status != "已完成":
+        update_live_record(settings, record_id, {
+            "录制状态": recording_status, "转写状态": "已完成", "完成提醒状态": "无需发送",
+            "失败原因": integrity_note,
+        })
+        return
     try:
         publish_finished_session(
             settings, account_name=account_name, session_id=session_id, minutes_url=minutes_url,
@@ -1249,10 +1262,17 @@ def stream_info(settings: Settings, url: str) -> dict[str, Any]:
 def start_recorder(
     settings: Settings, room_dir: Path, account_id: str, session_stamp: str, record_url: str,
 ) -> subprocess.Popen[bytes]:
-    """Start or resume a segmented recording without overwriting existing segments."""
+    """Start or resume a segmented recording without overwriting existing segments.
+
+    MPEG-TS is deliberately used for temporary segments. Unlike MP4, a TS
+    segment remains playable when ffmpeg is killed during a network outage;
+    the final archive is still merged and delivered as MP4.
+    """
     video_base = artifact_path(room_dir, "直播视频", account_id, session_stamp, "")
-    existing = [segment for segment in room_dir.glob(f"{video_base.name}_*.mp4")
-                if len(segment.stem.rsplit("_", 1)[-1]) == 3 and segment.stem.rsplit("_", 1)[-1].isdigit()]
+    existing = [segment for extension in ("mp4", "ts")
+                for segment in room_dir.glob(f"{video_base.name}_*.{extension}")
+                if len(segment.stem.rsplit("_", 1)[-1]) == 3
+                and segment.stem.rsplit("_", 1)[-1].isdigit()]
     indices = []
     for segment in existing:
         try:
@@ -1261,18 +1281,24 @@ def start_recorder(
             continue
     next_index = max(indices, default=-1) + 1
     command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", record_url,
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
+        "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "404,500,502,503,504",
+        "-reconnect_delay_max", "10", "-reconnect_max_retries", "5",
+        "-reconnect_delay_total_max", "60", "-rw_timeout", "30000000", "-i", record_url,
         "-c", "copy", "-f", "segment", "-segment_time", str(settings.segment_seconds),
-        "-segment_format", "mp4", "-segment_start_number", str(next_index),
-        "-reset_timestamps", "1", "-movflags", "+faststart", f"{video_base}_%03d.mp4",
+        "-segment_format", "mpegts", "-segment_start_number", str(next_index),
+        "-reset_timestamps", "1", f"{video_base}_%03d.ts",
     ]
     return subprocess.Popen(command)
 
 
 def session_segments(room_dir: Path, account_name: str, session_id: str) -> list[Path]:
-    """Return only temporary recorder segments, never the final merged MP4."""
+    """Return temporary recorder segments, never the final merged MP4."""
     prefix = f"直播视频-{account_name}-{artifact_timestamp(session_id)}_"
-    return [segment for segment in sorted(room_dir.glob(f"{prefix}*.mp4"))
+    candidates = [segment for extension in ("ts", "mp4")
+                  for segment in room_dir.glob(f"{prefix}*.{extension}")]
+    return [segment for segment in sorted(candidates)
             if segment.stat().st_size >= 1024
             and len(segment.stem.rsplit("_", 1)[-1]) == 3
             and segment.stem.rsplit("_", 1)[-1].isdigit()]
@@ -1285,13 +1311,47 @@ def inferred_recording_end_ms(segments: list[Path]) -> int | None:
     return int(max(segment.stat().st_mtime for segment in segments) * 1000)
 
 
+def stop_recorder(process: subprocess.Popen[bytes] | None, timeout: float = 20.0) -> None:
+    """Finish ffmpeg without leaving a half-written segment behind.
+
+    A stalled HLS process may ignore SIGTERM. Force-killing it is preferable
+    to allowing the room worker to remain stuck and to repeatedly process the
+    same unfinished file.
+    """
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def recorder_is_stalled(
+    process: subprocess.Popen[bytes], room_dir: Path, account_name: str, session_id: str,
+    process_started_at: float, *, stall_seconds: int, startup_grace_seconds: int,
+) -> bool:
+    """Detect a live ffmpeg process whose output has stopped advancing."""
+    if process.poll() is not None:
+        return False
+    now = time.time()
+    segments = session_segments(room_dir, account_name, session_id)
+    if not segments:
+        return now - process_started_at >= startup_grace_seconds
+    latest_mtime = max(segment.stat().st_mtime for segment in segments)
+    return now - latest_mtime >= stall_seconds
+
+
 def run_room(settings: Settings, account_id: str, registry: dict[str, Account], registry_lock: threading.Lock, ledger: DeliveryLedger) -> None:
     room_dir = settings.output_dir / account_id
     room_dir.mkdir(parents=True, exist_ok=True)
     active = False
     process: subprocess.Popen[bytes] | None = None
+    process_started_at = 0.0
     session_stamp: str | None = None
     session_snapshot: dict[str, Any] | None = ledger.active_session(account_id)
+    offline_checks = 0
     if session_snapshot:
         active = True
         session_stamp = session_snapshot["session_id"]
@@ -1308,8 +1368,33 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 update_account_state(settings, account, status="未使用")
                 time.sleep(settings.poll_seconds)
                 continue
-            info = stream_info(settings, url)
-            live = bool(info.get("is_live") and info.get("record_url"))
+            try:
+                info = stream_info(settings, url)
+            except Exception as exc:
+                # Resolver failures are often transient. Keep the session
+                # alive, but restart a recorder that has stopped producing
+                # data so its next attempt can use a fresh URL.
+                print(f"{account_id}: stream lookup failed: {exc}", flush=True)
+                if active and process and recorder_is_stalled(
+                    process, room_dir, (session_snapshot or {}).get("account_name", account.name),
+                    session_stamp or "unknown", process_started_at,
+                    stall_seconds=settings.recorder_stall_seconds,
+                    startup_grace_seconds=settings.recorder_startup_grace_seconds,
+                ):
+                    ledger.record_recorder_stop(account_id, int(time.time() * 1000))
+                    stop_recorder(process)
+                    process = None
+                time.sleep(settings.poll_seconds)
+                continue
+            stream_live = bool(info.get("is_live"))
+            record_url = str(info.get("record_url") or "")
+            live = stream_live and bool(record_url)
+            if stream_live:
+                # A live room without a fresh URL is a transient resolver or
+                # CDN problem, not proof that the broadcast has ended.
+                offline_checks = 0
+            else:
+                offline_checks += 1
             if live and active and process and process.poll() is None:
                 # A restarted recorder has survived one polling interval, so
                 # a previous process exit was transient rather than the end
@@ -1323,7 +1408,8 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     active, session_stamp = False, None
                     time.sleep(settings.poll_seconds)
                     continue
-                process = start_recorder(settings, room_dir, account.name, session_stamp, info["record_url"])
+                process = start_recorder(settings, room_dir, account.name, session_stamp, record_url)
+                process_started_at = time.time()
                 record_id = create_live_record(settings, account, session_stamp, info.get("title", ""), started_ms, account.recipients)
                 ledger.set_session_record_id(account_id, record_id)
                 session_snapshot = {"account_name": account.name, "recipients": account.recipients, "record_id": record_id, "started_ms": started_ms, "ended_ms": None}
@@ -1333,18 +1419,34 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
             elif live and active and process and process.poll() is not None and not (session_snapshot or {}).get("ended_ms"):
                 exit_code = process.returncode
                 ledger.record_recorder_stop(account_id, int(time.time() * 1000))
+                time.sleep(settings.recorder_restart_backoff_seconds)
                 process = start_recorder(
                     settings, room_dir, account.name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    info["record_url"],
+                    record_url,
                 )
+                process_started_at = time.time()
                 print(f"Recorder restarted: {url}; previous exit code {exit_code}", flush=True)
+            elif live and active and process and recorder_is_stalled(
+                process, room_dir, (session_snapshot or {}).get("account_name", account.name),
+                session_stamp or "unknown", process_started_at,
+                stall_seconds=settings.recorder_stall_seconds,
+                startup_grace_seconds=settings.recorder_startup_grace_seconds,
+            ) and not (session_snapshot or {}).get("ended_ms"):
+                ledger.record_recorder_stop(account_id, int(time.time() * 1000))
+                print(f"Recorder stalled; restarting: {url}", flush=True)
+                stop_recorder(process)
+                time.sleep(settings.recorder_restart_backoff_seconds)
+                process = start_recorder(
+                    settings, room_dir, account.name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    record_url,
+                )
+                process_started_at = time.time()
             elif live and active and process is None and not (session_snapshot or {}).get("ended_ms"):
                 snap_name = (session_snapshot or {}).get("account_name", account.name)
-                process = start_recorder(settings, room_dir, snap_name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"), info["record_url"])
-            if active and not live:
-                if process:
-                    process.terminate()
-                    process.wait(timeout=30)
+                process = start_recorder(settings, room_dir, snap_name, session_stamp or datetime.now().strftime("%Y%m%d_%H%M%S"), record_url)
+                process_started_at = time.time()
+            if active and offline_checks >= settings.offline_confirmations:
+                stop_recorder(process)
                 snap_name = (session_snapshot or {}).get("account_name", account.name)
                 snap_recipients = (session_snapshot or {}).get("recipients", account.recipients)
                 record_id = (session_snapshot or {}).get("record_id", "")
@@ -1358,6 +1460,27 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     session_snapshot["ended_ms"] = ended_ms
                 if settings.transcription_mode == "local_pull":
                     manifest = room_dir / f"{session_stamp}_pending_transcription.json"
+                    try:
+                        valid_segments, segment_metadata, invalid_segments = inspect_recording_segments(segments)
+                        recording_status, integrity_note = recording_integrity_result(
+                            segment_metadata, invalid_segments, max(0.0, (ended_ms - started_ms) / 1000),
+                        )
+                    except RecordingIntegrityError as exc:
+                        valid_segments, recording_status, integrity_note = [], "部分录制", str(exc)
+                    if not valid_segments:
+                        update_live_record(settings, record_id, {
+                            "直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}",
+                            "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)),
+                            "录制状态": "部分录制" if segments else "录制失败", "转写状态": "转写失败",
+                            "完成提醒状态": "无需发送", "失败原因": integrity_note or "下播后没有可读取的录像分段",
+                        })
+                        ledger.end_session(account_id)
+                        update_account_state(settings, account, status="正常使用", ended=ended_ms)
+                        active, process, session_stamp, session_snapshot = False, None, None, None
+                        process_started_at = 0.0
+                        offline_checks = 0
+                        time.sleep(settings.poll_seconds)
+                        continue
                     manifest.write_text(json.dumps({
                         "session_id": session_stamp,
                         "account_id": account_id,
@@ -1367,14 +1490,21 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                         "url": url,
                         "anchor_name": account.name,
                         "title": info.get("title", ""),
-                        "segments": [segment.name for segment in segments],
+                        "recording_status": recording_status,
+                        "integrity_note": integrity_note,
+                        # Only stable, playable segments are sent to the local
+                        # worker. Damaged files remain on the server for
+                        # diagnosis instead of causing the whole job to fail.
+                        "segments": [segment.name for segment in valid_segments],
                         "created_at": datetime.now().isoformat(timespec="seconds"),
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
-                    update_live_record(settings, record_id, {"直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}", "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)), "录制状态": "已完成" if segments else "录制失败", "转写状态": "待转写" if segments else "转写失败", "完成提醒状态": "待发送" if segments else "无需发送"})
+                    update_live_record(settings, record_id, {"直播记录": f"【{snap_name}】{datetime.fromtimestamp(started_ms / 1000).strftime('%Y%m%d_%H%M')}-{datetime.fromtimestamp(ended_ms / 1000).strftime('%H%M')}", "下播时间": ended_ms, "直播时长（分钟）": max(0, int((ended_ms - started_ms) / 60000)), "录制状态": recording_status if segments else "录制失败", "转写状态": "待转写" if valid_segments else "转写失败", "完成提醒状态": "待发送" if valid_segments else "无需发送", "失败原因": integrity_note})
                     ledger.end_session(account_id)
                     update_account_state(settings, account, status="正常使用", ended=ended_ms)
                     print(f"Local transcription queued: {manifest}", flush=True)
                     active, process, session_stamp = False, None, None
+                    process_started_at = 0.0
+                    offline_checks = 0
                     time.sleep(settings.poll_seconds)
                     continue
                 if settings.transcription_mode == "feishu_minutes":
@@ -1409,6 +1539,8 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                     update_account_state(settings, account, status="正常使用", ended=ended_ms)
                     print(f"Feishu Minutes processing finished: {url}; {len(segments)} segments", flush=True)
                     active, process, session_stamp, session_snapshot = False, None, None, None
+                    process_started_at = 0.0
+                    offline_checks = 0
                     time.sleep(settings.poll_seconds)
                     continue
                 transcripts = []
@@ -1427,6 +1559,8 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 update_live_record(settings, record_id, {"录制状态": "已完成", "转写状态": "已完成", "完成提醒状态": "已发送", "完成提醒时间": int(time.time() * 1000)})
                 print(f"Live finished: {url}; {len(segments)} segments, {len(full)} chars", flush=True)
                 active, process, session_stamp, session_snapshot = False, None, None, None
+                process_started_at = 0.0
+                offline_checks = 0
             time.sleep(settings.poll_seconds)
         except Exception as exc:
             print(f"{account_id}: {exc}", flush=True)
@@ -1455,7 +1589,11 @@ def main() -> None:
                         drive_root_folder_token=cfg.get("drive_root_folder_token", ""),
                         drive_platform_folder_name=cfg.get("drive_platform_folder_name", "抖音"),
                         minutes_poll_seconds=int(cfg.get("minutes_poll_seconds", 60)),
-                        minutes_timeout_seconds=int(cfg.get("minutes_timeout_seconds", 7200)))
+                        minutes_timeout_seconds=int(cfg.get("minutes_timeout_seconds", 7200)),
+                        recorder_stall_seconds=int(cfg.get("recorder_stall_seconds", 180)),
+                        recorder_startup_grace_seconds=int(cfg.get("recorder_startup_grace_seconds", 120)),
+                        recorder_restart_backoff_seconds=int(cfg.get("recorder_restart_backoff_seconds", 5)),
+                        offline_confirmations=max(1, int(cfg.get("offline_confirmations", 3))))
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     registry: dict[str, Account] = {}
     registry_lock = threading.Lock()
