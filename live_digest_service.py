@@ -587,28 +587,20 @@ def attach_session_artifacts(settings: Settings, record_id: str, *, minutes_url:
 
 
 def concat_segments(segments: list[Path], output: Path) -> Path:
-    """Join recorder segments into the one complete MP4 that gets archived."""
+    """Transcode recorder segments into the normalized archive MP4."""
     if not segments:
         raise RuntimeError("No recording segments to merge")
     output.parent.mkdir(parents=True, exist_ok=True)
-    if len(segments) == 1:
-        if segments[0].resolve() != output.resolve():
-            subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(segments[0]),
-                            "-c", "copy", "-movflags", "+faststart", str(output)], check=True)
-        return output
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".ffconcat", delete=False) as handle:
         concat_file = Path(handle.name)
         for segment in segments:
             # ffconcat requires single quotes to be escaped in file paths.
             handle.write(f"file '{str(segment.resolve()).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
     try:
-        fast_command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                        "-i", str(concat_file), "-c", "copy", "-movflags", "+faststart", str(output)]
-        copied = subprocess.run(fast_command, check=False)
-        if copied.returncode != 0:
-            subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                            "-i", str(concat_file), "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart",
-                            str(output)], check=True)
+        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                        "-i", str(concat_file), "-vf", "scale=-2:720", "-r", "30",
+                        "-c:v", "libx264", "-b:v", "1.8M", "-c:a", "aac", "-b:a", "96k",
+                        "-movflags", "+faststart", str(output)], check=True)
     finally:
         concat_file.unlink(missing_ok=True)
     return output
@@ -704,6 +696,15 @@ def verify_merged_video(path: Path, segment_metadata: list[VideoMetadata]) -> Vi
             f"有效分段合计 {expected_duration:.1f} 秒"
         )
     return merged
+
+
+def cleanup_merged_segments(segments: list[Path]) -> None:
+    """Delete only segments that passed local validation and were merged."""
+    for path in segments:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"Merged segment cleanup failed for {path}: {exc}", flush=True)
 
 
 def drive_download_size(settings: Settings, file_token: str) -> int:
@@ -1211,6 +1212,7 @@ def complete_with_feishu_minutes(
                     ensure_merge_space(valid_segments, room_dir)
                     concat_segments(valid_segments, complete_video)
                 merged_metadata = verify_merged_video(complete_video, segment_metadata)
+                cleanup_merged_segments(valid_segments)
                 update_live_record(settings, record_id, {
                     "录制状态": recording_status, "转写状态": "转写中", "失败原因": integrity_note,
                 })

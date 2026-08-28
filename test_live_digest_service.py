@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from live_digest_service import (
     Account, CompletionNotificationError, DeliveryLedger, LowDiskSpaceError, Settings, artifact_path,
-    attach_session_artifacts, cleanup_uploaded_recordings, complete_with_feishu_minutes, concat_segments,
+    attach_session_artifacts, cleanup_merged_segments, cleanup_uploaded_recordings,
+    complete_with_feishu_minutes, concat_segments,
     create_live_record, drive_file_url, ensure_merge_space, find_minutes_documents, message_url,
     RecordingIntegrityError, VideoMetadata, recording_complete_message, recording_complete_post,
     recording_integrity_result, send_post, session_segments, sync_accounts, upload_drive_file,
@@ -201,8 +202,14 @@ class FeishuConfigTest(unittest.TestCase):
             concat_segments([first, second], output)
         command = run.call_args.args[0]
         self.assertIn("concat", command)
-        self.assertIn("-c", command)
-        self.assertIn("copy", command)
+        self.assertIn("-c:v", command)
+        self.assertIn("libx264", command)
+        self.assertIn("-b:v", command)
+        self.assertIn("1.8M", command)
+        self.assertIn("-r", command)
+        self.assertIn("30", command)
+        self.assertIn("-b:a", command)
+        self.assertIn("96k", command)
         self.assertEqual(command[-1], str(output))
         self.assertEqual(len(manifests[0].splitlines()), 2)
         self.assertNotIn("\\nfile", manifests[0])
@@ -221,6 +228,38 @@ class FeishuConfigTest(unittest.TestCase):
             self.assertFalse(second.exists())
             self.assertFalse(complete.exists())
             self.assertTrue(current_recording.exists())
+
+    def test_cleanup_merged_segments_removes_only_merged_segments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            first = folder / "session_000.mp4"
+            second = folder / "session_001.mp4"
+            unrelated = folder / "current_000.mp4"
+            for path in (first, second, unrelated):
+                path.write_bytes(b"data")
+            cleanup_merged_segments([first, second])
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_cleanup_merged_segments_continues_after_delete_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            failed = folder / "failed.mp4"
+            removed = folder / "removed.mp4"
+            failed.write_bytes(b"data")
+            removed.write_bytes(b"data")
+            original_unlink = Path.unlink
+
+            def unlink(path, missing_ok=False):
+                if path == failed:
+                    raise OSError("permission denied")
+                return original_unlink(path, missing_ok=missing_ok)
+
+            with patch.object(Path, "unlink", new=unlink):
+                cleanup_merged_segments([failed, removed])
+            self.assertTrue(failed.exists())
+            self.assertFalse(removed.exists())
 
     def test_cleanup_preserves_files_when_verified_size_differs(self):
         with tempfile.TemporaryDirectory() as directory:
