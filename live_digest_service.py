@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import concurrent.futures
 import hashlib
 import json
 import os
@@ -86,6 +85,7 @@ class VideoMetadata:
 
 
 _VIDEO_ARCHIVE_LOCK = threading.Lock()
+_FEISHU_MINUTES_MAX_FILE_BYTES = 6 * 1024 * 1024 * 1024
 
 
 class DeliveryLedger:
@@ -858,7 +858,6 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
     block_size = int(checkpoint["block_size"])
     block_num = int(checkpoint["block_num"])
     completed_parts = {int(sequence) for sequence in checkpoint.get("completed_parts", [])}
-    checkpoint_lock = threading.Lock()
     token = user_token(settings)
 
     def upload_part(sequence: int) -> None:
@@ -881,10 +880,9 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
                     files={"file": (path.name, block)}, timeout=300,
                 )
                 feishu_response_data(response)
-                with checkpoint_lock:
-                    completed_parts.add(sequence)
-                    checkpoint["completed_parts"] = sorted(completed_parts)
-                    _write_upload_checkpoint(checkpoint_path, checkpoint)
+                completed_parts.add(sequence)
+                checkpoint["completed_parts"] = sorted(completed_parts)
+                _write_upload_checkpoint(checkpoint_path, checkpoint)
                 report_progress()
                 return
             except requests.RequestException:
@@ -893,9 +891,8 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
                 time.sleep(min(30, 2 ** attempt))
 
     pending_parts = [sequence for sequence in range(block_num) if sequence not in completed_parts]
-    # A large recording is split into thousands of parts; a small bounded
-    # worker pool keeps uploads moving without creating an unbounded request
-    # burst against Feishu.
+    # Feishu requires upload_part calls to be serial. Sending several parts at
+    # once can make an otherwise valid upload fail at the TLS/API layer.
     progress_lock = threading.Lock()
     last_reported_count = len(completed_parts)
     last_progress_report = time.monotonic()
@@ -919,8 +916,8 @@ def upload_drive_file(settings: Settings, path: Path, folder_token: str) -> str:
         flush=True,
     )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(pending_parts) or 1)) as executor:
-        list(executor.map(upload_part, pending_parts))
+    for sequence in pending_parts:
+        upload_part(sequence)
     current_stat = path.stat()
     if (
         current_stat.st_size != initial_stat.st_size
@@ -1212,6 +1209,12 @@ def complete_with_feishu_minutes(
                     ensure_merge_space(valid_segments, room_dir)
                     concat_segments(valid_segments, complete_video)
                 merged_metadata = verify_merged_video(complete_video, segment_metadata)
+                if merged_metadata.size_bytes > _FEISHU_MINUTES_MAX_FILE_BYTES:
+                    size_gib = merged_metadata.size_bytes / 1024 ** 3
+                    raise RecordingIntegrityError(
+                        f"录像 {size_gib:.2f} GB，超过飞书妙记单文件 6 GB 上限；"
+                        "未上传，请拆分或压缩后再提交转写"
+                    )
                 cleanup_merged_segments(valid_segments)
                 update_live_record(settings, record_id, {
                     "录制状态": recording_status, "转写状态": "转写中", "失败原因": integrity_note,
