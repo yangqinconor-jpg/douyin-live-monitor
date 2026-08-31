@@ -438,6 +438,7 @@ class FeishuConfigTest(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertIn("-reconnect_on_http_error", command)
         self.assertIn("404,500,502,503,504", command)
+        self.assertNotIn("-reconnect_max_retries", command)
         self.assertIn("-segment_format", command)
         self.assertEqual(command[command.index("-segment_format") + 1], "mpegts")
         self.assertTrue(command[-1].endswith("_%03d.ts"))
