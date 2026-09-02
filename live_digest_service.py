@@ -1466,7 +1466,10 @@ def run_room(settings: Settings, account_id: str, registry: dict[str, Account], 
                 time.sleep(settings.poll_seconds)
                 continue
             stream_live = bool(info.get("is_live"))
-            record_url = str(info.get("record_url") or "")
+            # Prefer FLV for long-running FFmpeg recording. On this server's
+            # FFmpeg 4.4, the returned HLS playlist can stall while FLV keeps
+            # delivering the live stream; keep HLS as a resolver fallback.
+            record_url = str(info.get("flv_url") or info.get("record_url") or "")
             live = stream_live and bool(record_url)
             if stream_live:
                 # A live room without a fresh URL is a transient resolver or

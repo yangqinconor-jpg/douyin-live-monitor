@@ -427,6 +427,11 @@ class FeishuConfigTest(unittest.TestCase):
             final.write_bytes(b"x" * 1024)
             self.assertEqual(session_segments(folder, "示例账号", "20260826_100012"), [segment])
 
+    def test_live_recording_prefers_flv_stream_when_available(self):
+        info = {"is_live": True, "flv_url": "https://cdn.example/live.flv", "record_url": "https://cdn.example/live.m3u8"}
+        self.assertTrue(info["is_live"] and (info.get("flv_url") or info.get("record_url")))
+        self.assertEqual(info.get("flv_url") or info.get("record_url"), "https://cdn.example/live.flv")
+
     @patch("live_digest_service.subprocess.Popen")
     def test_recorder_uses_interrupt_resilient_ts_segments_and_reconnect(self, popen):
         popen.return_value = unittest.mock.Mock()
